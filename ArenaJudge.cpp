@@ -1,4 +1,10 @@
-﻿#include "RequirementsCheck.h"
+﻿#include "ArenaJudge.h"
+#include "SocialLogic.h"
+#include "PluginRuntime.h"
+#include "GroupLogic.h"
+#include "GroupBrawl.h"
+#include "DebugLog.h"
+#include "RequirementsCheck.h"
 #include "FreezeFix.h"
 #include "CrashDiag.h"
 
@@ -14,176 +20,58 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 
 //
-// Genome Logic Fix: arena judging (stages 2, 3, 4) and the INI configuration (stage 6).
+// Genome Logic Fix: arena policy and centralized registration adapters.
 //
-namespace RequirementsCheck
+namespace ArenaJudge::Punishment
 {
-    //
-    // Configuration: <Gothic 3 folder>\Ini\Script_GenomeLogicFix.ini, section [Main], line "PunishArenaPotions=true".
-    //
     namespace
     {
-        GELPCChar const INI_FILE_NAME = "Script_GenomeLogicFix.ini";
-        GELPCChar const INI_SECTION = "Main";
-        GELPCChar const INI_KEY_PUNISH_POTIONS = "PunishArenaPotions";
-        GELPCChar const INI_KEY_IGNORE_TELEPORT = "IgnoreTeleportNames"; // v1.0.51.0
-        GELPCChar const INI_MISSING_MARK = "<<missing>>";                // tells "no such key" from "the key is empty"
-        GELPCChar const INI_KEY_ENCHANTED = "AllowArenaEnchantedWeapons"; // v1.0.52.0
-        GELPCChar const INI_KEY_HARD_SPEED = "EnableHardDifficultyAttackSpeed"; // v1.0.59.0
-        GELPCChar const INI_KEY_MIN_HIT = "DisableMinHitDurationOnHard";        // v1.0.59.0
-        GELPCChar const INI_KEY_CRASH_DIAG = "CrashDiagnostics";                 // v1.0.66.0
-
-        GEBool ParseIniBool(GELPCChar a_strValue)
-        {
-            return !(_stricmp(a_strValue, "false") == 0 || strcmp(a_strValue, "0") == 0 || _stricmp(a_strValue, "no") == 0 ||
-                     _stricmp(a_strValue, "off") == 0);
-        }
-
-        Config g_Config;
-
-        void BuildIniPath(char *o_pBuffer, size_t a_uSize)
-        {
-            char strExe[MAX_PATH] = {};
-            ::GetModuleFileNameA(nullptr, strExe, MAX_PATH);
-            char *pSlash = strrchr(strExe, '\\');
-            if (pSlash)
-                *pSlash = 0;
-            _snprintf_s(o_pBuffer, a_uSize, _TRUNCATE, "%s\\Ini\\%s", strExe, INI_FILE_NAME);
-        }
-    } // namespace
-
-    Config &GetConfig()
-    {
-        return g_Config;
+        bCString g_strStage2Hold;
+        GEU32 g_u32Stage2HoldTick = 0;
+        bCPropertyID g_arrArenaWitnessID[96];
+        GEInt g_iArenaWitnessCount = 0;
     }
+    GEBool IsCurrentArenaWitness(Entity &npc);
+    void NoteCurrentArenaWitness(Entity &npc);
+}
 
-    GEBool SaveConfig()
-    {
-        char strPath[MAX_PATH + 64] = {};
-        BuildIniPath(strPath, sizeof(strPath));
-        GEBool const bPotions = ::WritePrivateProfileStringA(INI_SECTION, INI_KEY_PUNISH_POTIONS,
-                                                             g_Config.PunishArenaPotions ? "true" : "false", strPath)
-                                    ? GETrue
-                                    : GEFalse;
-        GEBool const bNames = ::WritePrivateProfileStringA(INI_SECTION, INI_KEY_IGNORE_TELEPORT,
-                                                           g_Config.IgnoreTeleportNames, strPath)
-                                  ? GETrue
-                                  : GEFalse;
-        GEBool const bEnchanted = ::WritePrivateProfileStringA(INI_SECTION, INI_KEY_ENCHANTED,
-                                                               g_Config.AllowArenaEnchantedWeapons ? "true" : "false", strPath)
-                                      ? GETrue
-                                      : GEFalse;
-        GEBool const bHardSpeed = ::WritePrivateProfileStringA(INI_SECTION, INI_KEY_HARD_SPEED,
-                                                               g_Config.EnableHardDifficultyAttackSpeed ? "true" : "false", strPath)
-                                      ? GETrue
-                                      : GEFalse;
-        GEBool const bMinHit = ::WritePrivateProfileStringA(INI_SECTION, INI_KEY_MIN_HIT,
-                                                            g_Config.DisableMinHitDurationOnHard ? "true" : "false", strPath)
-                                   ? GETrue
-                                   : GEFalse;
-        GEBool const bCrashDiag = ::WritePrivateProfileStringA(INI_SECTION, INI_KEY_CRASH_DIAG,
-                                                               g_Config.CrashDiagnostics ? "true" : "false", strPath)
-                                      ? GETrue
-                                      : GEFalse;
-        return bPotions && bNames && bEnchanted && bHardSpeed && bMinHit && bCrashDiag ? GETrue : GEFalse;
-    }
+namespace ArenaJudge::Implementation
+{
+    using PluginRuntime::GetConfig;
+    using namespace PluginRuntime::HeroState;
+    using namespace PluginRuntime::Conflict;
+    using namespace ArenaJudge::Punishment;
+    using PluginRuntime::Hook_SessionStart;
+    using PluginRuntime::Hook_SessionStop;
+    using PluginRuntime::SessionStart;
+    using PluginRuntime::SessionStop;
+    using PluginRuntime::ResetBlowHistory;
+    using namespace GroupLogic::Brawl;
+    using namespace GroupLogic::Combat;
+    using SocialLogic::IsUnprovokedAssault;
+    using SocialLogic::IsWandererNpc;
+    using SocialLogic::IsTransformedHeroTarget;
+    using SocialLogic::HasBeenHurtBy;
+    using SocialLogic::IsSlaveTarget;
+    using SocialLogic::IsSlaveVsNoneBlocked;
+    using SocialLogic::IsWandererImmune;
+    using SocialLogic::LogPoliticalFilter;
+    using SocialLogic::IsFormWeaponBlocked;
+    using SocialLogic::LogFormWeapon;
 
-    void LoadConfig()
-    {
-        char strPath[MAX_PATH + 64] = {};
-        BuildIniPath(strPath, sizeof(strPath));
+    using SocialLogic::OnCityAssault;
+    using PluginRuntime::OnCityKnockout;
+    using SocialLogic::ReleaseWatcherIfOver;
+    using SocialLogic::ResetCityState;
+    using SocialLogic::IsPeaceful;
+    using SocialLogic::IsCityBrawlVictimAlive;
 
-        // Every key is read first, and the file is written once at the end when any key was missing (the defaults of the
-        // missing ones, the values of the existing ones are kept).
-        GEBool bWrite = GEFalse;
-
-        char strValue[32] = {};
-        ::GetPrivateProfileStringA(INI_SECTION, INI_KEY_PUNISH_POTIONS, "", strValue, sizeof(strValue), strPath);
-        if (strValue[0] == 0)
-            bWrite = GETrue; // File or key missing: keep the default (true) and write it.
-        else
-        {
-            g_Config.PunishArenaPotions = !(_stricmp(strValue, "false") == 0 || strcmp(strValue, "0") == 0 ||
-                                            _stricmp(strValue, "no") == 0 || _stricmp(strValue, "off") == 0);
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] PunishArenaPotions=%s\n",
-                                         g_Config.PunishArenaPotions ? "true" : "false");
-        }
-
-        // v1.0.51.0: IgnoreTeleportNames. An empty value is a valid answer ("nobody is blacklisted"), a missing key is not.
-        char strNames[sizeof(g_Config.IgnoreTeleportNames)] = {};
-        ::GetPrivateProfileStringA(INI_SECTION, INI_KEY_IGNORE_TELEPORT, INI_MISSING_MARK, strNames, sizeof(strNames), strPath);
-        if (strcmp(strNames, INI_MISSING_MARK) == 0)
-            bWrite = GETrue; // keep the default of the structure and write it
-        else
-            strncpy_s(g_Config.IgnoreTeleportNames, sizeof(g_Config.IgnoreTeleportNames), strNames, _TRUNCATE);
-        GetDefaultLogger().LogFormat("[GenomeLogicFix] IgnoreTeleportNames=%s\n", g_Config.IgnoreTeleportNames);
-
-        // v1.0.52.0: AllowArenaEnchantedWeapons (default true; a missing key is written with the default).
-        char strEnchanted[32] = {};
-        ::GetPrivateProfileStringA(INI_SECTION, INI_KEY_ENCHANTED, "", strEnchanted, sizeof(strEnchanted), strPath);
-        if (strEnchanted[0] == 0)
-            bWrite = GETrue;
-        else
-            g_Config.AllowArenaEnchantedWeapons = ParseIniBool(strEnchanted);
-        GetDefaultLogger().LogFormat("[GenomeLogicFix] AllowArenaEnchantedWeapons=%s\n",
-                                     g_Config.AllowArenaEnchantedWeapons ? "true" : "false");
-
-        // v1.0.59.0: EnableHardDifficultyAttackSpeed / DisableMinHitDurationOnHard (default false; a missing key is written).
-        char strHardSpeed[32] = {};
-        ::GetPrivateProfileStringA(INI_SECTION, INI_KEY_HARD_SPEED, "", strHardSpeed, sizeof(strHardSpeed), strPath);
-        if (strHardSpeed[0] == 0)
-            bWrite = GETrue;
-        else
-            g_Config.EnableHardDifficultyAttackSpeed = ParseIniBool(strHardSpeed);
-        char strMinHit[32] = {};
-        ::GetPrivateProfileStringA(INI_SECTION, INI_KEY_MIN_HIT, "", strMinHit, sizeof(strMinHit), strPath);
-        if (strMinHit[0] == 0)
-            bWrite = GETrue;
-        else
-            g_Config.DisableMinHitDurationOnHard = ParseIniBool(strMinHit);
-        GetDefaultLogger().LogFormat("[GenomeLogicFix] EnableHardDifficultyAttackSpeed=%s, DisableMinHitDurationOnHard=%s\n",
-                                     g_Config.EnableHardDifficultyAttackSpeed ? "true" : "false",
-                                     g_Config.DisableMinHitDurationOnHard ? "true" : "false");
-
-        // v1.0.66.0: CrashDiagnostics (default true; a missing key is written).
-        char strCrashDiag[32] = {};
-        ::GetPrivateProfileStringA(INI_SECTION, INI_KEY_CRASH_DIAG, "", strCrashDiag, sizeof(strCrashDiag), strPath);
-        if (strCrashDiag[0] == 0)
-            bWrite = GETrue;
-        else
-            g_Config.CrashDiagnostics = ParseIniBool(strCrashDiag);
-        GetDefaultLogger().LogFormat("[GenomeLogicFix] CrashDiagnostics=%s\n", g_Config.CrashDiagnostics ? "true" : "false");
-
-        if (bWrite)
-            SaveConfig();
-    }
-
-    // v1.0.51.0: the name is in the black list of the teleport (the list is split by commas / semicolons, the spaces around the
-    // names are cut, the case does not matter). The empty name is never in the list.
-    GEBool IsTeleportNameIgnored(GELPCChar a_strName)
-    {
-        if (!a_strName || !a_strName[0])
-            return GEFalse;
-        char const *pRead = g_Config.IgnoreTeleportNames;
-        while (*pRead)
-        {
-            while (*pRead == ',' || *pRead == ';' || *pRead == ' ' || *pRead == '\t')
-                ++pRead;
-            char const *pStart = pRead;
-            while (*pRead && *pRead != ',' && *pRead != ';')
-                ++pRead;
-            char const *pEnd = pRead;
-            while (pEnd > pStart && (pEnd[-1] == ' ' || pEnd[-1] == '\t'))
-                --pEnd;
-            size_t const uLength = static_cast<size_t>(pEnd - pStart);
-            if (uLength > 0 && uLength == strlen(a_strName) && _strnicmp(pStart, a_strName, uLength) == 0)
-                return GETrue;
-        }
-        return GEFalse;
-    }
-
+    using GroupLogic::IsHeroFormEntity;
+    using GroupLogic::IsHeroControlled;
+    using GroupLogic::IsHeroTransformedNow;
     //
     // Arena state. The duel is "IsArenaFight" when an NPC with AttackReason Arena targets the hero. The fight has
     // PHYSICALLY started when that opponent is in combat / arena AI mode and attacks the hero, or the hero stands in
@@ -281,7 +169,7 @@ namespace RequirementsCheck
                 return;
             ++s_iLines;
             Entity Zone = Entity::GetPlayer().GetZone();
-            GetDefaultLogger().LogFormat("[GenomeLogicFix][diag] arena: %s ignored - the hero is outside the zone of the "
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix][diag] arena: %s ignored - the hero is outside the zone of the "
                                          "arena (zone '%s').\n",
                                          a_strWhat, Zone != None ? Zone.GetName().GetText() : "-");
         }
@@ -300,20 +188,13 @@ namespace RequirementsCheck
     //
     namespace
     {
-        GEFloat const SPARE_RADIUS = 2500.0f;
-        GEBool g_bSpareArmed = GEFalse;
-        GEBool g_bSpareActive = GEFalse; // a protected knock-out is going on: the fall point below is valid
+
         GEBool g_bOverLineSaid = GEFalse; // v1.0.60.0: the opponent has already spoken over the fallen hero (once per mercy)
-        GEBool g_bSpareHeroSeenDown = GEFalse; // v1.0.54.0: the hero has really lain down since the fall was remembered
-        GEU32 g_u32SpareFallTick = 0;          // v1.0.54.0: the moment the fall was remembered
-        GEU32 const SPARE_FALL_GRACE_MS = 8000; // technical limit: the knock-out animation of the hero never takes this long
-        GEFloat g_fFallX = 0.0f;
-        GEFloat g_fFallY = 0.0f;
-        GEFloat g_fFallZ = 0.0f;
+
         // The duel was already ended for the current knock-out of the hero (once per knock-out, whoever knocked him out).
         GEBool g_bDuelLossDone = GEFalse;
         void ResetDuelState(); // the companions waiting for the duel and the "lost to a third party" mark; defined below
-        void ResetBlowHistory(GELPCChar a_strWhy); // v1.0.51.0: the clean slate of every blow counter (Mercy ended); below
+
         GEBool IsEnchantedMeleeEffect();           // v1.0.52.0: the status comes from an enchanted melee weapon; below
         void PunishRangedShot(GELPCChar a_strWhy); // v1.0.52.0: stage 2 for the bow / crossbow; below
         // v1.0.58.0: the crime + the duel quest is closed; below. v1.0.60.0: the opponent shouts a_strSvm (type a_u32Type) as he goes.
@@ -321,8 +202,7 @@ namespace RequirementsCheck
         void CancelDuelForForbiddenWeapon(GELPCChar a_strWhy);         // v1.0.58.0: the timer is out: the duel is cancelled; below
         void PollWarnTimer();                                          // v1.0.58.0: the timer of the warning; below
         GEBool FindDuelOpponentAnywhere(Entity &o_Opponent);           // v1.0.60.0: the opponent also before the ring; below
-        void ReleaseStage2Hold(GELPCChar a_strWhy);                    // v1.0.61.0: the hero fell: the opponent stops the fight; below
-        void PollStage2Hold();                                         // v1.0.61.0: the opponent is held in the attack; below
+
         void BeginFormAggro(Entity &a_Opponent, GEBool a_bOpponent);   // v1.0.67.0: the crowd + the opponent go for the form; below
         void PollFormAggro();                                          // v1.0.67.0: the orders when the form body appears; below
         GEBool IsHeroHoldingMagic();                                   // a rune / a scroll / a bow / a crossbow is in the hand; below
@@ -350,7 +230,7 @@ namespace RequirementsCheck
         void MarkWaiterAutoPublic(Entity &a_Npc);          // the plugin / the game ordered this wait (see WaiterType below)
         void MarkWaiterUserPublic(Entity &a_Npc);          // the player ordered this wait in the dialogue
         void ClearWaiterMarksPublic(Entity &a_Npc);        // the companion follows the hero again: no mark
-        GEBool IsHeroTransformedNow();                     // v1.0.48.0: the hero is in a beast body; defined below
+        using GroupLogic::IsHeroTransformedNow;                     // v1.0.48.0: the hero is in a beast body; defined below
         GEBool IsHeroDuelBlocked();                        // v1.0.48.0: the safety lock of the duel hooks; defined below
         GEBool IsTransformSpellInHand();                   // v1.0.48.0: the spell of the hero is a transformation; below
         void ResetDuelForTransform(GELPCChar a_strWhy);    // v1.0.48.0: the reset of the duel by a transformation; below
@@ -360,13 +240,7 @@ namespace RequirementsCheck
         GEBool g_bThirdPartyMessage = GEFalse;
         void AnnounceLossToThirdParty(); // the message "the fight is lost", once per duel; defined below
         void EndArenaDuelAfterKnockout();                       // defined below, with the arena helpers
-        void RememberHeroFall(GEBool a_bEndDuel = GETrue);      // defined below
 
-        GEBool IsHeroKnockedOut()
-        {
-            Entity Hero = Entity::GetPlayer();
-            return Hero.IsDown() || Hero.Routine.AIMode == gEAIMode_Down;
-        }
 
         //
         // v1.0.60.0: THE VOICES OF THE ENDS OF THE ARENA VIOLATIONS (native SVM lines of Script_Game.dll 1.8.7):
@@ -384,8 +258,6 @@ namespace RequirementsCheck
         // any of the 52 voice sets). "Good" ("Good!" / "Хорошо!") exists in every voice set and in SVMAdmin.dat.
         GELPCChar const ARENA_APPROVE_SVM = "Good";
         // v1.0.61.0: the opponent that is held in the fight against the hero after stage 2 (by name, empty: nobody), see PollStage2Hold.
-        bCString g_strStage2Hold;
-        GEU32 g_u32Stage2HoldTick = 0;
         GEBool g_bOverLinePending = GEFalse; // the hero fell after a violation: the opponent says his line when the hero lies
         bCString g_strOverOpponent;
         GEU32 g_u32OverLineTick = 0;
@@ -402,12 +274,12 @@ namespace RequirementsCheck
                 a_Speaker.Routine.AIMode == gEAIMode_Down || HasTask(a_Speaker, "ZS_Unconscious") ||
                 HasTask(a_Speaker, "ZS_LieKnockDown") || HasTask(a_Speaker, "ZS_PiercedKO"))
             {
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Arena voice '%s' (%s): the speaker is gone or lies unconscious - silent.\n",
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Arena voice '%s' (%s): the speaker is gone or lies unconscious - silent.\n",
                                              a_strSvm, a_strWhy);
                 return GEFalse;
             }
             ::StartSaySVM(a_Speaker, a_Target, bCString(a_strSvm), a_u32Type);
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Arena voice: '%s' says '%s' (%s).\n", a_Speaker.GetName().GetText(),
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Arena voice: '%s' says '%s' (%s).\n", a_Speaker.GetName().GetText(),
                                          a_strSvm, a_strWhy);
             return GETrue;
         }
@@ -456,152 +328,18 @@ namespace RequirementsCheck
         // routine is the ordinary one on his feet (the state PS_Normal_Loop / PS_Melee_Loop, also PS_Ranged_Walk_Loop and
         // PS_Magic_Loop when he stood up with a bow / a rune in the hand). No timer is involved except the technical net below.
         //
-        GEBool g_bHeroImmune = GEFalse;
-        GEBool g_bHeroImmuneSeenDown = GEFalse; // the hero was really seen down / rising since the immunity began
-        GEU32 g_u32HeroImmuneTick = 0;
-
-        GEBool IsHeroDownOrRising()
-        {
-            if (IsHeroKnockedOut())
-                return GETrue;
-            Entity Hero = Entity::GetPlayer();
-            if (Hero == None)
-                return GEFalse;
-            bCString const strTask = Hero.Routine.GetCurrentTask();
-            bCString const strState = Hero.Routine.GetCurrentState();
-            static GELPCChar const arrDown[] = {"ZS_Unconscious", "ZS_LieKnockDown", "ZS_PiercedKO",
-                                                "ZS_SitKnockDown", "ZS_StandUp",     "ZS_Fall"};
-            for (GELPCChar strPrefix : arrDown)
-            {
-                size_t const uLen = strlen(strPrefix);
-                if (_strnicmp(strTask.GetText(), strPrefix, uLen) == 0 || _strnicmp(strState.GetText(), strPrefix, uLen) == 0)
-                    return GETrue;
-            }
-            return GEFalse;
-        }
-
-        // The hero stands on his feet in an ordinary routine of the player: the loop state of the player routine (PS_Normal_Loop,
-        // PS_Melee_Loop, PS_Ranged_Walk_Loop, PS_Magic_Loop, ...), i.e. a state PS_*_Loop. The knock-down / rising states are ZS_*.
-        GEBool IsHeroOnFeetRoutine()
-        {
-            Entity Hero = Entity::GetPlayer();
-            if (Hero == None)
-                return GEFalse;
-            bCString const strState = Hero.Routine.GetCurrentState();
-            GELPCChar const strText = strState.GetText();
-            size_t const uLen = strlen(strText);
-            return uLen > 8 && _strnicmp(strText, "PS_", 3) == 0 && _stricmp(strText + uLen - 5, "_Loop") == 0 ? GETrue : GEFalse;
-        }
-
-        GEU32 g_u32HeroUpSince = 0; // the moment the hero was first seen NOT down / rising after the fall (0: he is down)
-        GEU32 const HERO_UP_NET_MS = 6000; // technical net: a rising that never reaches a loop state (an unknown state name)
-        GEU32 const HERO_UP_DEBOUNCE_MS = 600; // technical debounce of the "on his feet" reading (not a game timing)
-
-        void ResetHeroImmunity()
-        {
-            g_bHeroImmune = GEFalse;
-            g_bHeroImmuneSeenDown = GEFalse;
-            g_u32HeroImmuneTick = 0;
-            g_u32HeroUpSince = 0;
-        }
-
-        // The Defeat hook: the hero is about to fall (the knock-out itself is not visible yet).
-        void BeginHeroImmunity()
-        {
-            if (!g_bHeroImmune)
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] The hero is down: nobody can kill him until he has risen.\n");
-            g_bHeroImmune = GETrue;
-            g_bHeroImmuneSeenDown = IsHeroDownOrRising();
-            g_u32HeroImmuneTick = ::GetTickCount() | 1;
-        }
-
-        // True: the hero is immune NOW (down, rising, or the fall has just begun). Called wherever the death of the hero is decided
-        // and from the housekeeping; it also starts the immunity when the hero is seen down by a path that did not go through Defeat.
-        GEBool UpdateHeroImmunity()
-        {
-            if (Entity::GetPlayer() == None)
-                return GEFalse;
-            if (IsHeroDownOrRising())
-            {
-                if (!g_bHeroImmune)
-                {
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix] The hero is down: nobody can kill him until he has risen.\n");
-                    g_u32HeroImmuneTick = ::GetTickCount() | 1;
-                }
-                g_bHeroImmune = GETrue;
-                g_bHeroImmuneSeenDown = GETrue;
-                g_u32HeroUpSince = 0; // down (again): the count of the technical net starts over
-                return GETrue;
-            }
-            if (!g_bHeroImmune)
-                return GEFalse;
-            if (g_bHeroImmuneSeenDown)
-            {
-                if (g_u32HeroUpSince == 0)
-                    g_u32HeroUpSince = ::GetTickCount() | 1;
-                GEU32 const u32UpFor = ::GetTickCount() - g_u32HeroUpSince;
-                GEBool const bNet = static_cast<GEInt>(u32UpFor) >= static_cast<GEInt>(HERO_UP_NET_MS);
-                // The loop state must hold for HERO_UP_DEBOUNCE_MS: a one-frame flicker of the routine (the log shows PS_Melee_Loop
-                // right after Defeat) is not a hero who stands.
-                GEBool const bStands = IsHeroOnFeetRoutine() && static_cast<GEInt>(u32UpFor) >= static_cast<GEInt>(HERO_UP_DEBOUNCE_MS);
-                if (!bStands && !bNet)
-                    return GETrue; // up, but still in the animation of rising / not yet in the ordinary routine
-                {
-                    bCString const strState = Entity::GetPlayer().Routine.GetCurrentState();
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix] The hero has risen (state '%s'%s): the immunity is over.\n",
-                                                 strState.GetText(), bNet ? ", technical net" : "");
-                }
-                ResetHeroImmunity();
-                return GEFalse;
-            }
-            // The fall was announced by the Defeat hook but the knock-out never showed (the technical net, not a game timing).
-            if (static_cast<GEInt>(::GetTickCount() - g_u32HeroImmuneTick) >= static_cast<GEInt>(SPARE_FALL_GRACE_MS))
-            {
-                ResetHeroImmunity();
-                return GEFalse;
-            }
-            return GETrue;
-        }
-
         // g_bSpareSawEnemy: after arming, somebody within SPARE_RADIUS really fought the hero (target = hero, a reason to
         // attack). The mercy ends by an EVENT: the hero is on his feet and nobody around him fights him any more.
-        // g_bSpareArena: armed by an arena violation (ended by the arena code if nobody ever reacted).
-        GEBool g_bSpareSawEnemy = GEFalse;
-        GEBool g_bSpareArena = GEFalse;
-        GEU32 g_u32SpareScan = 0; // technical throttle of the scan below (not a game timing)
+        // IsArenaPunishment(): armed by an arena violation (ended by the arena code if nobody ever reacted).
 
         // The NPCs the plugin sent against the hero (by name). When the hero stands up after a protected knock-out, each
         // of them calms down as soon as he runs his own attack loop (also those who were too far to see the fall and
         // arrive later): no timer, the event "the hero is on his feet" releases them.
-        GEInt const AGGRO_MAX = 96;
-        bCString g_arrAggroNames[AGGRO_MAX];
-        GEInt g_iAggroCount = 0;
-        GEBool g_bAggroRelease = GEFalse;
 
-        GEInt FindAggro(bCString const &a_strName)
-        {
-            for (GEInt i = 0; i < g_iAggroCount; ++i)
-                if (g_arrAggroNames[i] == a_strName)
-                    return i;
-            return -1;
-        }
+        // Witnesses of the CURRENT arena violation only, not the history of aggro.
 
-        void NoteAggro(Entity &a_Npc)
-        {
-            g_bAggroRelease = GEFalse; // a new conflict: the old release is void
-            bCString const strName = a_Npc.GetName();
-            if (g_iAggroCount >= AGGRO_MAX || FindAggro(strName) >= 0)
-                return;
-            g_arrAggroNames[g_iAggroCount++] = strName;
-        }
 
-        void ClearAggro()
-        {
-            for (GEInt i = 0; i < AGGRO_MAX; ++i)
-                g_arrAggroNames[i] = bCString();
-            g_iAggroCount = 0;
-            g_bAggroRelease = GEFalse;
-        }
+
 
         //
         // v1.0.67.0: THE CROWD AND THE OPPONENT ARE AIMED AT THE HERO'S FORM. A transformation in the ring removes the body PC_Hero, so
@@ -645,13 +383,12 @@ namespace RequirementsCheck
             g_iFormOrderNames = 0;
         }
 
-        void ResetSpare(); // defined below
 
         // The NPC was sent against the hero by the plugin (the crowd of a crime, or the duel opponent that stays in the fight against the
         // form of the hero). The native filters of the built-in weapon of a form must not calm such an NPC down.
         GEBool IsSentAgainstHero(Entity &a_Npc)
         {
-            if (!g_bSpareArmed || a_Npc == None)
+            if (!IsArmed() || a_Npc == None)
                 return GEFalse;
             bCString const strName = a_Npc.GetName();
             if (FindAggro(strName) >= 0)
@@ -659,149 +396,10 @@ namespace RequirementsCheck
             return !g_strFormOpponent.IsEmpty() && g_strFormOpponent == strName ? GETrue : GEFalse;
         }
 
-        void ArmSpare(GELPCChar a_strWhy, GEBool a_bArena = GEFalse)
-        {
-            // v1.0.67.0: A STALE MERCY. A fall of the hero that is long over (he stands on his feet, he is not rising) but whose mercy was
-            // never closed - the mercy is closed by an attack loop of somebody who fights him, and nobody did after that fall - must not
-            // be taken for the fall of the NEW violation. Before, the first attack loop of the new fight found "the hero is on his feet
-            // again", wrote Mercy ended and calmed down the whole crowd in the same frame (the log of the transformation in the ring).
-            // The fall that has just been remembered (the knock-out is not visible yet) is not stale.
-            GEBool const bFalling = !g_bSpareHeroSeenDown &&
-                                    static_cast<GEInt>(::GetTickCount() - g_u32SpareFallTick) < static_cast<GEInt>(SPARE_FALL_GRACE_MS);
-            if (g_bSpareActive && !bFalling && !IsHeroDownOrRising())
-            {
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Mercy: the old fall of the hero is over (he stands) - a new mercy starts.\n");
-                ResetSpare();
-                ResetHeroImmunity();
-            }
-            if (!g_bSpareArmed)
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Mercy armed: %s.\n", a_strWhy);
-            g_bSpareArmed = GETrue;
-            if (a_bArena)
-                g_bSpareArena = GETrue;
-            if (!IsHeroKnockedOut())
-                g_bDuelLossDone = GEFalse; // a new violation: the next knock-out ends the duel again
-        }
 
-        void ResetSpare()
-        {
-            ResetFormAggro(); // v1.0.67.0: the mercy is over: nobody is aimed at a form any more
-            g_strStage2Hold = bCString(); // v1.0.61.0: the mercy is over: the opponent is not held in the fight any more
-            g_bOverLineSaid = GEFalse;
-            g_bOverLinePending = GEFalse;
-            g_bSpareArmed = GEFalse;
-            g_bSpareActive = GEFalse;
-            g_bSpareHeroSeenDown = GEFalse;
-            g_u32SpareFallTick = 0;
-            g_bSpareSawEnemy = GEFalse;
-            g_bSpareArena = GEFalse;
-            g_bDuelLossDone = GEFalse;
-        }
 
-        // The hero stands again after a protected knock-out: the mercy and the fall point are dropped at once.
-        // Armed but not yet used: it ends when somebody fought the hero and now nobody does.
-        void SpareHousekeeping()
-        {
-            // v1.0.54.0: THE MERCY ENDS ONLY AFTER THE HERO HAS REALLY LAIN DOWN AND STOOD UP AGAIN. The fall is remembered in the
-            // Defeat hook BEFORE the native Defeat runs, i.e. while the hero is not yet "down": the first loop of an attacker that
-            // asked "is the hero on his feet?" ended the mercy in the very frame of the fall, and the crowd killed the hero as he
-            // went down (mercy armed=0 -> "leaves yes"). Now the mercy waits until the knock-out is seen (g_bSpareHeroSeenDown);
-            // a technical safety limit (the knock-out that never comes) ends it anyway.
-            if (g_bSpareActive && IsHeroKnockedOut())
-                g_bSpareHeroSeenDown = GETrue;
-            if (g_bSpareActive && !IsHeroKnockedOut() && !g_bSpareHeroSeenDown &&
-                static_cast<GEInt>(::GetTickCount() - g_u32SpareFallTick) < static_cast<GEInt>(SPARE_FALL_GRACE_MS))
-                return; // the hero is going down: the mercy stays
-            // v1.0.57.0: the mercy ends together with the immunity - when the hero has completely risen (not while he is rising).
-            if (g_bSpareActive && !IsHeroKnockedOut() && !UpdateHeroImmunity())
-            {
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Mercy ended: the hero is on his feet again; the NPCs sent "
-                                             "against him (%d) calm down.\n",
-                                             static_cast<int>(g_iAggroCount));
-                ResetSpare();
-                g_bAggroRelease = g_iAggroCount > 0;
-                ResetBlowHistory("Mercy ended: the hero is on his feet again"); // v1.0.51.0: a new fight starts from scratch
-                return;
-            }
-            // The knock-out of the hero is noticed here as well, not only in Defeat: a knock-out by a witness does not go
-            // through the Defeat hook (no log line in the game), and the duel must end whoever knocked the hero out.
-            if (g_bSpareArmed && !g_bSpareActive && IsHeroKnockedOut())
-            {
-                RememberHeroFall();
-                return;
-            }
-            if (!g_bSpareArmed || g_bSpareActive || IsHeroKnockedOut())
-                return;
-            // v1.0.67.0: between the cast of the transformation and the appearance of the form body nobody has the NEW body as the target
-            // yet (they still aim at the removed PC_Hero): that is not "nobody fights the hero any more", the mercy must not end here.
-            if (g_bFormAggroPending)
-                return;
-            GEU32 const u32Now = ::GetTickCount();
-            if (g_u32SpareScan != 0 && static_cast<GEInt>(u32Now - g_u32SpareScan) < 500)
-                return;
-            g_u32SpareScan = u32Now;
 
-            Entity Hero = Entity::GetPlayer();
-            GEBool bFight = GEFalse;
-            bTObjArray<Entity> arrNPCs = Entity::GetNPCs();
-            for (GEInt i = 0; i < arrNPCs.GetCount() && !bFight; ++i)
-            {
-                Entity Npc = arrNPCs.GetAt(i);
-                if (Npc == Hero || !Npc.IsNPC() || Npc.IsDead() || Npc.IsDown())
-                    continue;
-                if (Npc.GetDistanceTo(Hero) > SPARE_RADIUS)
-                    continue;
-                if (Npc.NPC.GetCurrentTarget() == Hero && Npc.NPC.AttackReason != gEAttackReason_None)
-                    bFight = GETrue;
-            }
-            if (bFight)
-                g_bSpareSawEnemy = GETrue;
-            else if (g_bSpareSawEnemy)
-            {
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Mercy ended: nobody fights the hero any more.\n");
-                ResetSpare();
-                ResetBlowHistory("Mercy ended: nobody fights the hero any more");
-            }
-        }
 
-        // The place where the hero fell (called when the hero is knocked out, and again by the first NPC that asks).
-        void RememberHeroFall(GEBool a_bEndDuel)
-        {
-            if (!g_bSpareArmed || g_bSpareActive)
-                return;
-            bCVector const vFall = Entity::GetPlayer().GetPosition();
-            g_fFallX = vFall.m_fX;
-            g_fFallY = vFall.m_fY;
-            g_fFallZ = vFall.m_fZ;
-            g_bSpareActive = GETrue;
-            g_bSpareHeroSeenDown = IsHeroKnockedOut();
-            g_u32SpareFallTick = ::GetTickCount() | 1;
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] The hero fell at (%.0f, %.0f, %.0f): nobody within %.0f may "
-                                         "kill him.\n",
-                                         static_cast<double>(g_fFallX), static_cast<double>(g_fFallY),
-                                         static_cast<double>(g_fFallZ), static_cast<double>(SPARE_RADIUS));
-            // A violation of the arena rules (not the city): the duel is over for everybody, the opponent leaves.
-            if (a_bEndDuel && g_bSpareArena)
-                EndArenaDuelAfterKnockout();
-        }
-
-        // True: this NPC must not kill the knocked-out hero (armed, hero down, NPC within SPARE_RADIUS of the fall point).
-        GEBool SpareApplies(Entity &a_Npc, GEFloat &o_fDistance)
-        {
-            o_fDistance = -1.0f;
-            SpareHousekeeping();
-            // v1.0.54.0: while the hero is still going down (the fall is remembered, the knock-out not yet seen) the mercy applies too.
-            GEBool const bGoingDown = g_bSpareActive && !g_bSpareHeroSeenDown;
-            if (!g_bSpareArmed || (!IsHeroKnockedOut() && !bGoingDown))
-                return GEFalse;
-            RememberHeroFall();
-            bCVector const vNpc = a_Npc.GetPosition();
-            GEFloat const fDx = vNpc.m_fX - g_fFallX;
-            GEFloat const fDy = vNpc.m_fY - g_fFallY;
-            GEFloat const fDz = vNpc.m_fZ - g_fFallZ;
-            o_fDistance = std::sqrt(fDx * fDx + fDy * fDy + fDz * fDz);
-            return o_fDistance <= SPARE_RADIUS;
-        }
     } // namespace
     //
     // Consumables in a started arena fight (PunishArenaPotions): the hero LOSES the duel through the same native path as
@@ -837,7 +435,7 @@ namespace RequirementsCheck
                     continue;
                 gEQuestStatus const enuStatus = pQuest->GetStatus();
                 if (enuStatus == gEQuestStatus_Running || enuStatus == gEQuestStatus_Lost)
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix] %s: duel quest '%s' status=%d\n", a_strWhen,
+                    DebugLog::GetLogger().LogFormat("[GenomeLogicFix] %s: duel quest '%s' status=%d\n", a_strWhen,
                                                  pQuest->GetName().GetText(), static_cast<int>(enuStatus));
             }
         }
@@ -852,7 +450,7 @@ namespace RequirementsCheck
             if (!FindArenaOpponent(Opponent) && !FindRememberedOpponent(Opponent))
                 return;
 
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] %s (opponent '%s').\n",
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix] %s (opponent '%s').\n",
                                          a_bCompanions ? "The hero entered the arena with companions / summons"
                                                        : (a_bMagic ? "Magic cast during the arena duel"
                                                                    : "Consumable used during the arena fight"),
@@ -897,16 +495,13 @@ namespace RequirementsCheck
             }
         }
 
-        GEBool IsHeroControlled(Entity &a_Npc); // defined below, with the rule for the controlled creatures
-        GEBool IsHeroFormEntity(Entity &a_Npc);                  // defined below
-        GEBool IsHeroSide(Entity &a_Npc);                        // defined below
+        using GroupLogic::IsHeroControlled; // defined below, with the rule for the controlled creatures
+        using GroupLogic::IsHeroFormEntity;                  // defined below
+
         GEBool IsDuelTaboo(Entity &a_Npc);                       // defined below: the opponent of the duel / arena
-        void DefendAllies(Entity &a_Victim, Entity &a_Attacker); // defined below: one for all, all for one
-        void ClearDefendedTargets();                             // defined below
-        void ClearFocusRecords();                                // defined below
-        Entity GetDamageOwnerNpc(Entity &a_Source);                       // defined below
-        GEBool IsFriendlyFire(Entity &a_Attacker, Entity &a_Victim, GEBool a_bAreaDamage = GEFalse,
-                              Entity *a_pSource = nullptr); // defined below
+
+
+
         GEBool HasRunningArenaQuest();          // defined below
         void TrackDuelForCompanions();          // defined below: the companions wait while the duel quest runs
         void OnArenaQuestStarted(GEBool a_bFromLost = GEFalse); // defined below: the order to wait, ONCE, at the start of the quest
@@ -939,7 +534,7 @@ namespace RequirementsCheck
                     continue;
                 if (Npc.Party.Waiting)
                     continue; // a waiting companion never costs the duel (and does not fight: he stands and waits)
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] '%s' (controlled by the hero, party type %d) is inside the "
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] '%s' (controlled by the hero, party type %d) is inside the "
                                              "arena zone while the duel quest runs.\n",
                                              Npc.GetName().GetText(), static_cast<int>(Npc.Party.PartyMemberType));
                 ForceArenaDefeat(GETrue);
@@ -998,7 +593,7 @@ namespace RequirementsCheck
 
     void OnHeroConsumeStarted()
     {
-        if (!g_Config.PunishArenaPotions)
+        if (!GetConfig().PunishArenaPotions)
             return;
         // The quest is running, but the hero is not in the ring / the fight has not begun: healing is allowed.
         GEBool const bInside = IsHeroInsideArenaZone();
@@ -1008,7 +603,7 @@ namespace RequirementsCheck
             if (s_iLines < 20 && HasRunningArenaQuest())
             {
                 ++s_iLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Consumable used while the duel quest runs, but %s: no penalty.\n",
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Consumable used while the duel quest runs, but %s: no penalty.\n",
                                              bInside ? "the fight has not begun yet (nobody of the duel attacks the hero)"
                                                      : "the hero is outside the arena");
             }
@@ -1044,24 +639,31 @@ namespace RequirementsCheck
         };
 
         mEWitnessVerdict GetWitnessVerdict(Entity &a_Npc, Entity &a_Hero, Entity &a_Opponent,
-                                           GEBool a_bIgnoreLos = GEFalse)
+                                           GEBool a_bIgnoreLos = GEFalse, GELPCChar *o_pReason = nullptr)
         {
-            if (a_Npc == a_Hero || a_Npc == a_Opponent || a_Npc == None)
-                return mEWitnessVerdict_NotAWitness;
-            if (!a_Npc.IsNPC() || a_Npc.IsDead() || a_Npc.IsDown())
-                return mEWitnessVerdict_NotAWitness;
+            auto verdict = [o_pReason](mEWitnessVerdict value, GELPCChar reason)
+            { if (o_pReason) *o_pReason = reason; return value; };
+            if (a_Npc == None)
+                return verdict(mEWitnessVerdict_NotAWitness, "missing entity");
+            if (a_Npc == a_Hero)
+                return verdict(mEWitnessVerdict_NotAWitness, "the player");
+            if (a_Npc == a_Opponent)
+                return verdict(mEWitnessVerdict_NotAWitness, "the current duel opponent is handled separately");
+            if (!a_Npc.IsNPC())
+                return verdict(mEWitnessVerdict_NotAWitness, "not an NPC");
+            if (a_Npc.IsDead() || a_Npc.IsDown())
+                return verdict(mEWitnessVerdict_NotAWitness, "dead or knocked down");
             if (!AI_Decision::IsHumanoid(a_Npc))
-                return mEWitnessVerdict_NotAWitness;
-            // The companions of the hero never testify against him.
-            if (a_Npc.Party.GetPartyLeader() == a_Hero)
-                return mEWitnessVerdict_NotAWitness;
-            // The arena is no business of slaves and of people without any faction.
+                return verdict(mEWitnessVerdict_NotAWitness, "not humanoid");
+            if (IsHeroSide(a_Npc) || IsHeroControlled(a_Npc))
+                return verdict(mEWitnessVerdict_NotAWitness, "belongs to the player, including transformed leader");
             if (a_bIgnoreLos && (AI_Decision::IsSlave(a_Npc) || a_Npc.NPC.PoliticalAlignment == gEPoliticalAlignment_None))
-                return mEWitnessVerdict_NotAWitness;
+                return verdict(mEWitnessVerdict_NotAWitness, "slave or no political faction at an arena violation");
             if (a_Npc.GetDistanceTo(a_Hero) > WITNESS_RADIUS)
-                return mEWitnessVerdict_TooFar;
-            return (a_bIgnoreLos || a_Npc.IsFreeLOS(a_Hero, GEFalse)) ? mEWitnessVerdict_Ok
-                                                                       : mEWitnessVerdict_NoLineOfSight;
+                return verdict(mEWitnessVerdict_TooFar, "outside witness radius");
+            if (!a_bIgnoreLos && !a_Npc.IsFreeLOS(a_Hero, GEFalse))
+                return verdict(mEWitnessVerdict_NoLineOfSight, "no line of sight");
+            return verdict(mEWitnessVerdict_Ok, "witness of the current violation");
         }
 
         // The current task of the NPC is exactly the given one. AssessTarget (Script_Game.dll 1.8.7) switches an NPC with
@@ -1099,6 +701,16 @@ namespace RequirementsCheck
             a_Witness.Routine.SetTask(bFights ? "ZS_Attack" : "ZS_Flee");
         }
 
+        void ForceAttack(Entity &a_Npc, Entity &a_Hero, gEAttackReason a_enuReason)
+        {
+            NoteAggro(a_Npc);
+            a_Npc.Routine.FullStop();
+            a_Npc.NPC.SetCurrentTarget(a_Hero);
+            a_Npc.NPC.AttackReason = a_enuReason;
+            a_Npc.Routine.SetTask("ZS_Attack");
+        }
+
+
         GEU32 g_u32LastDeclare = 0;
         // a_bImmediate: the reaction must not wait for the 0.7 s pause between two searches for witnesses (the moment
         // a status effect starts is a single event: it is not repeated by the next hit).
@@ -1116,6 +728,8 @@ namespace RequirementsCheck
             if (bArenaViolation)
                 ArmSpare("a violation of the arena rules", GETrue);
 
+            if (bArenaViolation)
+                g_iArenaWitnessCount = 0; // Revalidate everyone for this violation.
             GEInt iAlerted = 0;
             GEInt iForced = 0;
             GEInt iTooFar = 0;
@@ -1125,7 +739,11 @@ namespace RequirementsCheck
             {
                 Entity Witness = arrNPCs.GetAt(i);
                 // Arena violation: the whole crowd within the radius is told, nobody has to look at the very moment.
-                mEWitnessVerdict const enuVerdict = GetWitnessVerdict(Witness, Hero, Opponent, bArenaViolation);
+                GELPCChar reason = "unknown";
+                mEWitnessVerdict const enuVerdict = GetWitnessVerdict(Witness, Hero, Opponent, bArenaViolation, &reason);
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix][witness] '%s': %s (%s), arena=%d\n",
+                    Witness != None ? Witness.GetName().GetText() : "<none>",
+                    enuVerdict == mEWitnessVerdict_Ok ? "INCLUDED" : "EXCLUDED", reason, static_cast<int>(bArenaViolation));
                 if (enuVerdict == mEWitnessVerdict_TooFar)
                     ++iTooFar;
                 else if (enuVerdict == mEWitnessVerdict_NoLineOfSight)
@@ -1133,8 +751,18 @@ namespace RequirementsCheck
                 if (enuVerdict != mEWitnessVerdict_Ok)
                     continue;
 
-                if (HasReacted(Witness, Hero))
+                // Reaching here means this NPC witnessed THIS incident.
+                if (SocialLogic::ObserveSlaveWitness(Witness, Hero, Opponent))
                     continue;
+                if (bArenaViolation)
+                    NoteCurrentArenaWitness(Witness);
+                if (HasReacted(Witness, Hero))
+                {
+                    NoteAggro(Witness);
+                    DebugLog::GetLogger().LogFormat("[GenomeLogicFix][witness] '%s': already reacting, registered for this incident.\n",
+                                                   Witness.GetName().GetText());
+                    continue;
+                }
 
                 // The crime is written down for the witness (gEPlayerCrime_Attack = 2, same call as in Defeat) ...
                 AI_Memory::MemorizePlayerCrime(Witness, Hero, gEPlayerCrime_Attack);
@@ -1151,7 +779,7 @@ namespace RequirementsCheck
                     NoteAggro(Witness);
                 ++iAlerted;
             }
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Crime: %s -> %d witness(es) react (%d of them forced), "
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Crime: %s -> %d witness(es) react (%d of them forced), "
                                          "%d too far, %d without line of sight.\n",
                                          a_strWhy, iAlerted, iForced, iTooFar, iNoLos);
         }
@@ -1179,13 +807,13 @@ namespace RequirementsCheck
         //  - while the punishment is under way: the mercy of the arena violation is armed (ArmSpare) and the hero has not fallen
         //    yet, he stands in the ring (the silent Failed of the magic punishment closes the quest long before he falls).
         // It is allowed as soon as the hero is on his feet again - the very condition of the native event "Mercy ended: the
-        // hero is on his feet again" (g_bSpareActive && !IsHeroKnockedOut) -, when the hero won (no mercy armed), or when he
+        // hero is on his feet again" (IsFallActive() && !IsHeroKnockedOut) -, when the hero won (no mercy armed), or when he
         // left the ring (the escape). Pure reads of the native state.
         GEBool IsArenaReleaseAllowed()
         {
             if (IsHeroKnockedOut())
                 return GEFalse;
-            if (g_bSpareArmed && g_bSpareArena && !g_bSpareActive && IsHeroInsideArenaZone())
+            if (IsArmed() && IsArenaPunishment() && !IsFallActive() && IsHeroInsideArenaZone())
                 return GEFalse;
             return GETrue;
         }
@@ -1200,740 +828,6 @@ namespace RequirementsCheck
             return a_pEntity ? *static_cast<Entity *>(a_pEntity) : Entity(a_pFallback);
         }
 
-        // The TRUE creator of a damaging object. For a spell the damage object is the projectile entity (or the
-        // spell container / burning effect), and its Owner can be the projectile itself or a spell container, not the
-        // hero. The chain is followed link by link (Owner -> User -> parent Spell, at most MAX_LINKS deep) and the
-        // hero is looked for in every link; the last inflictor stored on the victim is the final fallback.
-        GEBool IsCreatedByHero(Entity &a_Victim, Entity &a_Source)
-        {
-            Entity Hero = Entity::GetPlayer();
-            if (a_Source == Hero)
-                return GETrue;
-
-            Entity Current = a_Source;
-            for (GEInt iLink = 0; iLink < 4 && Current != None; ++iLink)
-            {
-                if (!Current.Interaction.IsValid())
-                    break;
-
-                Entity Owner = Current.Interaction.GetOwner();
-                Entity User = Current.Interaction.GetUser();
-                if (Owner == Hero || User == Hero)
-                    return GETrue;
-
-                Entity Spell = Current.Interaction.GetSpell();
-                if (Spell != None && Spell != Current && Spell.Interaction.IsValid() &&
-                    (Spell.Interaction.GetOwner() == Hero || Spell.Interaction.GetUser() == Hero))
-                    return GETrue;
-
-                // Next link: the owner (the caster or the projectile that carries the spell).
-                if (Owner == None || Owner == Current)
-                    break;
-                Current = Owner;
-            }
-
-            if (a_Victim.DamageReceiver.IsValid())
-            {
-                Entity Inflictor = a_Victim.DamageReceiver.GetLastInflictor();
-                if (Inflictor == Hero)
-                    return GETrue;
-            }
-            return GEFalse;
-        }
-
-        //
-        // Assault of a hero with a high reputation. Script_Game.dll 1.8.7 (GetAttitudeToPlayer / GetZoneAttitudeToPlayer)
-        // compares the political fame and the city (enclave) fame of the hero with 0x4B = 75: from 75 up (the maximum is
-        // 100) every resident is "Friendly" to him, and the perception scripts (AssessHit / AssessMurder) then ignore
-        // the beating of a fellow citizen. Below 75 the game reacts by itself, so the plugin only steps in from 75.
-        //
-        GEI32 const REPUTATION_MIN = 75;
-        GEU32 const ASSAULT_MEMORY_MS = 30000;
-        bCString g_strAssaultVictim;
-        GEU32 g_u32AssaultUntil = 0;
-
-        // The hero has a reputation of REPUTATION_MIN or more in the city / political group of the NPC.
-        GEBool HasHighReputation(Entity &a_Npc, GEI32 &o_iEnclaveFame, GEI32 &o_iPoliticalFame)
-        {
-            o_iEnclaveFame = -1;
-            o_iPoliticalFame = -1;
-
-            Entity City = a_Npc.NPC.GetEnclave();
-            if (City != None && City.Enclave.IsValid())
-                o_iEnclaveFame = City.Enclave.PlayerFame;
-
-            Entity Hero = Entity::GetPlayer();
-            if (Hero.PlayerMemory.IsValid())
-            {
-                gEPoliticalAlignment const enuAlignment = a_Npc.NPC.PoliticalAlignment;
-                o_iPoliticalFame = Hero.PlayerMemory.GetPoliticalFame(enuAlignment);
-            }
-            return o_iEnclaveFame >= REPUTATION_MIN || o_iPoliticalFame >= REPUTATION_MIN;
-        }
-
-        void RememberAssaultVictim(Entity &a_Victim)
-        {
-            g_strAssaultVictim = a_Victim.GetName();
-            g_u32AssaultUntil = ::GetTickCount() + ASSAULT_MEMORY_MS;
-            if (g_u32AssaultUntil == 0)
-                g_u32AssaultUntil = 1;
-        }
-
-        // The beating goes on: the same victim is hit again within ASSAULT_MEMORY_MS.
-        GEBool IsRememberedAssaultVictim(Entity &a_Victim)
-        {
-            if (g_u32AssaultUntil == 0 || static_cast<GEInt>(::GetTickCount() - g_u32AssaultUntil) >= 0)
-                return GEFalse;
-            return g_strAssaultVictim == a_Victim.GetName();
-        }
-
-        // The hero (with a reputation of 75+) hurts a peaceful humanoid and no legal duel is running (arena, duel quest).
-        GEBool IsUnprovokedAssault(Entity &a_Victim, Entity &a_Source)
-        {
-            Entity Hero = Entity::GetPlayer();
-            if (a_Victim == None || a_Victim == Hero || !a_Victim.IsNPC() || a_Victim.IsDead())
-                return GEFalse;
-
-            // Diagnostics (limited): why a hit on an NPC is, or is not, judged.
-            static GEInt s_iDiagLines = 0;
-            GEBool const bByHero = a_Source != None && IsCreatedByHero(a_Victim, a_Source);
-            GEBool const bHumanoid = AI_Decision::IsHumanoid(a_Victim);
-            if (bByHero && s_iDiagLines < 300)
-            {
-                ++s_iDiagLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix][diag] hero hits '%s' (humanoid=%d, source='%s')\n",
-                                             a_Victim.GetName().GetText(), static_cast<int>(bHumanoid),
-                                             a_Source.GetName().GetText());
-            }
-
-            if (!bByHero || !bHumanoid)
-                return GEFalse;
-
-            // A legal duel is no assault: the victim is the opponent of the duel, or the hero stands inside the ring. The
-            // duel quest is Running from the moment the duel is accepted, long before the hero enters the ring, so the
-            // quest alone does not make a blow on a bystander (Kulak, a guard, ...) legal - those are judged as usual.
-            Entity Opponent;
-            GEBool const bOpponentHit = FindArenaOpponent(Opponent) && a_Victim == Opponent;
-            GEBool const bInRing = HasRunningArenaQuest() && IsHeroInsideArenaZone();
-            if (bOpponentHit || bInRing)
-            {
-                if (s_iDiagLines < 300)
-                {
-                    ++s_iDiagLines;
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix][diag] ignored: a legal duel (the victim is the opponent=%d, "
-                                                 "the hero is in the ring=%d)\n",
-                                                 static_cast<int>(bOpponentHit), static_cast<int>(bInRing));
-                }
-                return GEFalse;
-            }
-
-            GEI32 iEnclaveFame = 0;
-            GEI32 iPoliticalFame = 0;
-            GEBool const bHighReputation = HasHighReputation(a_Victim, iEnclaveFame, iPoliticalFame);
-            GetDefaultLogger().LogFormat("[GenomeLogicFix][diag] hero hit '%s': enclave fame=%d, political fame=%d, "
-                                         "attackReason=%d, combatState=%u, attitude=%d -> %s\n",
-                                         a_Victim.GetName().GetText(), static_cast<int>(iEnclaveFame),
-                                         static_cast<int>(iPoliticalFame),
-                                         static_cast<int>(a_Victim.NPC.AttackReason),
-                                         static_cast<unsigned>(a_Victim.NPC.CombatState),
-                                         static_cast<int>(AI_Decision::GetAttitudeToPlayer(a_Victim)),
-                                         bHighReputation ? "reputation 75+" : "reputation below 75, the game reacts");
-            if (!bHighReputation)
-                return GEFalse;
-
-            // Further hits on the victim of a beating that already started: the witnesses are asked again.
-            if (IsRememberedAssaultVictim(a_Victim))
-                return GETrue;
-
-            // A legal fight: the victim already fights the hero, or is his enemy anyway.
-            // ReactToDamage is only the reaction to a blow: an NPC who answers the hero's hit is still a victim (the
-            // fighters like Kulak already stand in this state when the second blow comes).
-            // CombatState is NOT looked at: Kulak has combatState=1 from his very first hit with attackReason=0 (log),
-            // so it says nothing about a fight against the hero. Only a real attack reason does.
-            GEBool const bReactsToHit = a_Victim.NPC.AttackReason == gEAttackReason_ReactToDamage;
-            if (!bReactsToHit && a_Victim.NPC.AttackReason != gEAttackReason_None)
-                return GEFalse;
-            if (a_Victim.NPC.LastFightAgainstPlayer == gELastFightAgainstPlayer_Running)
-                return GEFalse;
-            gEAttitude const enuAttitude = AI_Decision::GetAttitudeToPlayer(a_Victim);
-            if (enuAttitude != gEAttitude_Friendly && enuAttitude != gEAttitude_Neutral)
-                return GEFalse;
-
-            RememberAssaultVictim(a_Victim);
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Assault on '%s': enclave fame=%d, political fame=%d, "
-                                         "attitude=%d.\n",
-                                         a_Victim.GetName().GetText(), static_cast<int>(iEnclaveFame),
-                                         static_cast<int>(iPoliticalFame), static_cast<int>(enuAttitude));
-            return GETrue;
-        }
-
-        //
-        // Two-stage reaction to a beating in a friendly city (reputation 75+, no arena).
-        //  1. FIRST BLOW - attention. The witnesses do NOT attack. Every peaceful witness in line of sight drops his
-        //     routine (sitting, smoking, forging), turns to the hero and watches: the sequence the native perception
-        //     script itself uses to make a watcher (FullStop, current target = hero, alternative target = victim,
-        //     SetTask("ZS_WatchFight")). The victim is left alone: the native reaction makes him draw the weapon, step
-        //     back and put it away again. A window of WATCH_MS starts. When it is over without a second blow the watchers
-        //     return to their routine (ContinueRoutine); the release is done by the hook of ZS_WatchFight_Loop, which
-        //     every watcher runs on every tick.
-        //  2. SECOND BLOW within the window - total aggro. The second blow is a blow on the same victim OR on another
-        //     peaceful resident who lives in the same enclave (city) / belongs to the same political faction as the first
-        //     victim and stands within WITNESS_RADIUS of the hero (a pogrom of different victims is no loophole). The
-        //     attack reason of the victims is overwritten with Murder, and they, all watchers and the guards in sight get
-        //     SetTask("ZS_Attack").
-        //
-        enum mECityPhase
-        {
-            mECityPhase_Idle = 0,
-            mECityPhase_Watching = 1,
-            mECityPhase_Aggro = 2,
-        };
-
-        GEU32 const WATCH_MS = 10000;  // the window for the second blow
-        GEU32 const BLOW_GAP_MS = 600; // one blow raises several events (damage, attacker set): count it once
-        GEInt const WATCH_MAX = 64;
-        mECityPhase g_enuCityPhase = mECityPhase_Idle;
-        bCString g_strCityVictim;                                          // the last victim of the current beating
-        bCString g_strCityEnclave;                                         // enclave of the first victim (empty: none)
-        gEPoliticalAlignment g_enuCityAlignment = gEPoliticalAlignment_None; // faction of the first victim
-        GEU32 g_u32WatchDeadline = 0;
-        GEU32 g_u32AggroUntil = 0;
-        GEU32 g_u32BlowTick = 0;
-        GEU32 g_u32LastAggroPass = 0;
-        bCString g_arrWatchNames[WATCH_MAX];
-        GEInt g_iWatchCount = 0;
-
-        GEBool TickReached(GEU32 a_u32Now, GEU32 a_u32Time)
-        {
-            return a_u32Time == 0 || static_cast<GEInt>(a_u32Now - a_u32Time) >= 0;
-        }
-
-        GEInt FindWatcher(bCString const &a_strName)
-        {
-            for (GEInt i = 0; i < g_iWatchCount; ++i)
-                if (g_arrWatchNames[i] == a_strName)
-                    return i;
-            return -1;
-        }
-
-        GEBool IsWatcher(Entity &a_Npc)
-        {
-            return FindWatcher(a_Npc.GetName()) >= 0;
-        }
-
-        void AddWatcher(Entity &a_Npc)
-        {
-            bCString const strName = a_Npc.GetName();
-            if (FindWatcher(strName) >= 0 || g_iWatchCount >= WATCH_MAX)
-                return;
-            g_arrWatchNames[g_iWatchCount++] = strName;
-        }
-
-        void RemoveWatcher(GEInt a_iIndex)
-        {
-            if (a_iIndex < 0 || a_iIndex >= g_iWatchCount)
-                return;
-            g_arrWatchNames[a_iIndex] = g_arrWatchNames[g_iWatchCount - 1];
-            --g_iWatchCount;
-        }
-
-        // An NPC that does his own business: he fights nobody and has no reason to fight.
-        GEBool IsPeaceful(Entity &a_Npc)
-        {
-            return a_Npc.NPC.AttackReason == gEAttackReason_None && a_Npc.NPC.CombatState == 0;
-        }
-
-        // Hard attack order: the NPC drops what he does and attacks the hero (what AssessTarget does for a fighter).
-        void ForceAttack(Entity &a_Npc, Entity &a_Hero, gEAttackReason a_enuReason)
-        {
-            NoteAggro(a_Npc);
-            a_Npc.Routine.FullStop();
-            a_Npc.NPC.SetCurrentTarget(a_Hero);
-            a_Npc.NPC.AttackReason = a_enuReason;
-            a_Npc.Routine.SetTask("ZS_Attack");
-        }
-
-        // Stage 1: the witnesses in sight stop what they do, turn to the hero and watch.
-        void StartWatching(Entity &a_Hero, Entity &a_Victim)
-        {
-            GEInt iNew = 0;
-            GEInt iAlready = 0;
-            GEInt iFailed = 0;
-            GEInt iBusy = 0;
-            GEInt iTooFar = 0;
-            GEInt iNoLos = 0;
-            bTObjArray<Entity> arrNPCs = Entity::GetNPCs();
-            // Forget the watchers of an earlier beating who are not watching any more.
-            for (GEInt i = 0; i < arrNPCs.GetCount(); ++i)
-            {
-                Entity Known = arrNPCs.GetAt(i);
-                GEInt const iKnown = FindWatcher(Known.GetName());
-                if (iKnown >= 0 && !HasTask(Known, "ZS_WatchFight"))
-                    RemoveWatcher(iKnown);
-            }
-            for (GEInt i = 0; i < arrNPCs.GetCount(); ++i)
-            {
-                Entity Witness = arrNPCs.GetAt(i);
-                mEWitnessVerdict const enuVerdict = GetWitnessVerdict(Witness, a_Hero, a_Victim);
-                if (enuVerdict == mEWitnessVerdict_TooFar)
-                    ++iTooFar;
-                else if (enuVerdict == mEWitnessVerdict_NoLineOfSight)
-                    ++iNoLos;
-                if (enuVerdict != mEWitnessVerdict_Ok)
-                    continue;
-
-                if (HasTask(Witness, "ZS_WatchFight"))
-                {
-                    AddWatcher(Witness);
-                    ++iAlready;
-                    continue;
-                }
-                // Somebody who already fights (a guard against a monster, a witness who attacks the hero) is left alone.
-                if (!IsPeaceful(Witness) || HasReacted(Witness, a_Hero))
-                {
-                    ++iBusy;
-                    continue;
-                }
-
-                Witness.Routine.FullStop();
-                Witness.NPC.SetCurrentTarget(a_Hero);
-                Witness.NPC.SetAlternativeTarget(a_Victim);
-                Witness.Routine.SetTask("ZS_WatchFight");
-                Witness.SetAlignmentTarget(a_Hero); // turn to the hero at once, the loop keeps him turned to the fight
-                if (HasTask(Witness, "ZS_WatchFight"))
-                {
-                    AddWatcher(Witness);
-                    ++iNew;
-                }
-                else
-                    ++iFailed;
-            }
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Assault, stage 1 (attention): '%s' was hit, %d witness(es) "
-                                         "watch now (%d already watched), %d busy, %d could not switch, %d too far, "
-                                         "%d without line of sight; window %u ms.\n",
-                                         a_Victim.GetName().GetText(), static_cast<int>(iNew),
-                                         static_cast<int>(iAlready), static_cast<int>(iBusy),
-                                         static_cast<int>(iFailed), static_cast<int>(iTooFar), static_cast<int>(iNoLos),
-                                         static_cast<unsigned>(WATCH_MS));
-        }
-
-        // Stage 2: total aggro. The victim gets a criminal attack reason, the watchers and the guards in sight attack.
-        // a_strFirstVictim: the victim of the first blow when the second blow hit somebody else (empty otherwise): he
-        // is ordered to attack as well, he is the one who was beaten first.
-        // v1.0.53.0: a_bInstantKnockout - the victim lay down from the very FIRST blow (the counter was wound on to the second one).
-        // The honest second blow reaches the crowd through the watchers of stage 1 (forced to ZS_Attack) and, for the rest, through
-        // the native AssessTarget, where the reputation 75+ of the hero "forgives" the beating. A one-shot knock-out has no
-        // time for stage 1 to gather everybody, so here EVERY witness that sees the hero is treated as a watcher: forced to attack
-        // (FullStop, the hero as the target, ZS_Attack), whatever the reputation, the weapon or the nature of the witness. The
-        // number of the attackers is that of the honest second blow with the same crowd around.
-        void StartTotalAggro(Entity &a_Hero, Entity &a_Victim, bCString const &a_strFirstVictim, GEBool a_bFirstTime,
-                             GEBool a_bInstantKnockout = GEFalse)
-        {
-            GEInt iForced = 0;
-            GEInt iReact = 0;
-            GEInt iTooFar = 0;
-            GEInt iNoLos = 0;
-
-            // The second blow: from now on nobody within SPARE_RADIUS of the place where the hero falls may kill him.
-            ArmSpare("the second blow in a city (total aggro)");
-
-            // v1.0.52.0: a victim who lies in the knock-out (by the flag, the Down mode or the native knock-out task) is never
-            // ordered to get up and fight - the witnesses carry the second blow, he lies on the ground.
-            GEBool const bVictimLies = a_Victim.IsDown() || a_Victim.Routine.AIMode == gEAIMode_Down ||
-                                       HasTask(a_Victim, "ZS_Unconscious") || HasTask(a_Victim, "ZS_LieKnockDown") ||
-                                       HasTask(a_Victim, "ZS_PiercedKO");
-            if (!a_Victim.IsDead() && !bVictimLies && !IsAttackingHero(a_Victim, a_Hero))
-            {
-                ForceAttack(a_Victim, a_Hero, gEAttackReason_Murder);
-                ++iForced;
-            }
-
-            bTObjArray<Entity> arrNPCs = Entity::GetNPCs();
-            for (GEInt i = 0; i < arrNPCs.GetCount(); ++i)
-            {
-                Entity Witness = arrNPCs.GetAt(i);
-                if (!a_strFirstVictim.IsEmpty() && !(Witness == a_Victim) && Witness.IsNPC() &&
-                    Witness.GetName() == a_strFirstVictim)
-                {
-                    if (!Witness.IsDead() && !Witness.IsDown() && !IsAttackingHero(Witness, a_Hero))
-                    {
-                        ForceAttack(Witness, a_Hero, gEAttackReason_Murder);
-                        ++iForced;
-                    }
-                    continue;
-                }
-                mEWitnessVerdict const enuVerdict = GetWitnessVerdict(Witness, a_Hero, a_Victim);
-                if (enuVerdict == mEWitnessVerdict_NotAWitness)
-                    continue;
-                // v1.0.53.0: after a one-shot knock-out everybody who sees the hero counts as a watcher (see above).
-                GEBool const bWatcher = IsWatcher(Witness) || (a_bInstantKnockout && enuVerdict == mEWitnessVerdict_Ok);
-                // The watchers have seen everything even if they stepped aside meanwhile; the others must see the hero now.
-                if (!bWatcher && enuVerdict != mEWitnessVerdict_Ok)
-                {
-                    if (enuVerdict == mEWitnessVerdict_TooFar)
-                        ++iTooFar;
-                    else
-                        ++iNoLos;
-                    continue;
-                }
-                if (IsAttackingHero(Witness, a_Hero))
-                    continue;
-
-                AI_Memory::MemorizePlayerCrime(Witness, a_Hero, gEPlayerCrime_Attack);
-                if (bWatcher || AI_Decision::IsGuard(Witness))
-                {
-                    ForceAttack(Witness, a_Hero, gEAttackReason_Enemy);
-                    ++iForced;
-                }
-                else
-                {
-                    AI_Perception::AssessTarget(Witness, a_Hero, gEAttackReason_Enemy);
-                    if (!HasReacted(Witness, a_Hero))
-                    {
-                        ForceReaction(Witness, a_Hero);
-                        ++iForced;
-                    }
-                    else
-                        NoteAggro(Witness);
-                    ++iReact;
-                }
-            }
-
-            g_iWatchCount = 0; // nobody watches any more, everybody fights
-            g_enuCityPhase = mECityPhase_Aggro;
-            g_u32AggroUntil = ::GetTickCount() + ASSAULT_MEMORY_MS;
-            if (g_u32AggroUntil == 0)
-                g_u32AggroUntil = 1;
-            RememberAssaultVictim(a_Victim); // the beating goes on: keep the victim in the memory
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Assault, stage 2 (%s): '%s' - %d ordered to ZS_Attack, "
-                                         "%d reacted by themselves, %d too far, %d without line of sight.\n",
-                                         a_bFirstTime ? "total aggro" : "aggro goes on", a_Victim.GetName().GetText(),
-                                         static_cast<int>(iForced), static_cast<int>(iReact), static_cast<int>(iTooFar),
-                                         static_cast<int>(iNoLos));
-        }
-
-        // Name of the enclave (city) the NPC lives in; empty if he belongs to none.
-        bCString GetEnclaveName(Entity &a_Npc)
-        {
-            Entity City = a_Npc.NPC.GetEnclave();
-            if (City != None && City.Enclave.IsValid())
-                return City.GetName();
-            return bCString();
-        }
-
-        // The victim belongs to the community of the first victim of the current beating (same enclave, or the same
-        // political faction) and is within the witness radius of the hero.
-        GEBool IsSameCommunityNearHero(Entity &a_Victim, Entity &a_Hero)
-        {
-            if (a_Victim.GetDistanceTo(a_Hero) > WITNESS_RADIUS)
-                return GEFalse;
-            bCString const strEnclave = GetEnclaveName(a_Victim);
-            if (!strEnclave.IsEmpty() && !g_strCityEnclave.IsEmpty() && strEnclave == g_strCityEnclave)
-                return GETrue;
-            gEPoliticalAlignment const enuAlignment = a_Victim.NPC.PoliticalAlignment;
-            return enuAlignment != gEPoliticalAlignment_None && enuAlignment == g_enuCityAlignment;
-        }
-
-        // Forgets everything about the beating of the hero: the phase (attention / aggro), the victims, the watchers, the
-        // memory of the assault and the NPCs marked as sparing. Called when a save game is loaded / a new game starts /
-        // the session stops: the state lives in the plugin, not in the save game, so without the reset the first blow
-        // after loading an earlier save would still be counted as the second one.
-        void ResetCityState(GELPCChar a_strWhy)
-        {
-            GEBool const bHadState = g_enuCityPhase != mECityPhase_Idle || g_iWatchCount != 0 ||
-                                     g_u32AssaultUntil != 0 || g_u32BlowTick != 0;
-            g_enuCityPhase = mECityPhase_Idle;
-            g_strCityVictim = bCString();
-            g_strCityEnclave = bCString();
-            g_enuCityAlignment = gEPoliticalAlignment_None;
-            g_u32WatchDeadline = 0;
-            g_u32AggroUntil = 0;
-            g_u32BlowTick = 0;
-            g_u32LastAggroPass = 0;
-            g_u32LastDeclare = 0;
-            g_iWatchCount = 0;
-            for (GEInt i = 0; i < WATCH_MAX; ++i)
-                g_arrWatchNames[i] = bCString();
-            g_strAssaultVictim = bCString();
-            g_u32AssaultUntil = 0;
-            ResetSpare();
-            ResetFormAggro();    // v1.0.67.0: nobody is aimed at a form of the previous session
-            ResetHeroImmunity(); // v1.0.57.0: a loaded save / a new session starts without the hold
-            ClearAggro();
-            ClearDefendedTargets();
-            ResetDuelState();
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] The assault counter is reset (%s)%s.\n", a_strWhy,
-                                         bHadState ? "" : ", nothing was pending");
-        }
-
-        // Entry point: the hero hit a peaceful resident of a friendly city (IsUnprovokedAssault said yes).
-        void OnCityAssault(Entity &a_Victim)
-        {
-            Entity Hero = Entity::GetPlayer();
-            GEU32 const u32Now = ::GetTickCount();
-
-            // Second line of defence next to the session hooks: a loaded save game creates the hero entity anew, so a
-            // different hero instance than at the previous blow means "another game state" - the old counter is void.
-            static eCEntity *s_pHeroInstance = nullptr;
-            eCEntity *pHeroInstance = Hero.GetInstance();
-            if (pHeroInstance != s_pHeroInstance)
-            {
-                if (s_pHeroInstance != nullptr)
-                    ResetCityState("the hero entity was replaced");
-                s_pHeroInstance = pHeroInstance;
-            }
-            bCString const strVictim = a_Victim.GetName();
-
-            // A phase that ran out is over.
-            if (g_enuCityPhase == mECityPhase_Watching && TickReached(u32Now, g_u32WatchDeadline))
-                g_enuCityPhase = mECityPhase_Idle;
-            if (g_enuCityPhase == mECityPhase_Aggro && TickReached(u32Now, g_u32AggroUntil))
-                g_enuCityPhase = mECityPhase_Idle;
-
-            // One blow raises several events (the damage script, SetCurrentAttacker, SetLastAttacker): count it once.
-            if (g_u32BlowTick != 0 && static_cast<GEInt>(u32Now - g_u32BlowTick) < static_cast<GEInt>(BLOW_GAP_MS))
-                return;
-
-            // The same victim, or - while a beating is going on - another resident of the same community near the hero.
-            // The victim of the first blow is remembered by name; "the same community" is the same enclave or the same
-            // political faction as the first victim, within the witness radius of the hero. A pogrom of different victims
-            // is therefore the second blow, not a new "peaceful" first blow.
-            GEBool const bSameVictim = g_enuCityPhase != mECityPhase_Idle && g_strCityVictim == strVictim;
-            GEBool const bOtherVictim = g_enuCityPhase != mECityPhase_Idle && !bSameVictim &&
-                                        IsSameCommunityNearHero(a_Victim, Hero);
-            bCString const strPrevious = bOtherVictim ? g_strCityVictim : bCString();
-
-            if ((bSameVictim || bOtherVictim) && g_enuCityPhase == mECityPhase_Aggro)
-            {
-                // The fight goes on: those who calmed down or came later are called again (at most every 0.7 s).
-                g_u32BlowTick = u32Now;
-                if (bOtherVictim || g_u32LastAggroPass == 0 ||
-                    static_cast<GEInt>(u32Now - g_u32LastAggroPass) >= 700)
-                {
-                    g_u32LastAggroPass = u32Now;
-                    StartTotalAggro(Hero, a_Victim, strPrevious, GEFalse);
-                }
-                return;
-            }
-
-            if ((bSameVictim || bOtherVictim) && g_enuCityPhase == mECityPhase_Watching)
-            {
-                // A burning / frozen victim is hurt again and again by the fire itself: that is not a new blow.
-                if (bSameVictim && (a_Victim.NPC.IsBurning() || a_Victim.NPC.IsFrozen()))
-                    return;
-                g_u32BlowTick = u32Now;
-                g_u32LastAggroPass = u32Now;
-                if (bOtherVictim)
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix] Assault: second blow within the window on ANOTHER "
-                                                 "resident of the same community: '%s' (first victim '%s').\n",
-                                                 strVictim.GetText(), strPrevious.GetText());
-                else
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix] Assault: second blow on '%s' within the window.\n",
-                                                 strVictim.GetText());
-                StartTotalAggro(Hero, a_Victim, strPrevious, GETrue);
-                return;
-            }
-
-            // The first blow (or the window / the aggro of the previous beating is over, or the victim is a stranger).
-            g_u32BlowTick = u32Now;
-            g_strCityVictim = strVictim;
-            g_strCityEnclave = GetEnclaveName(a_Victim);
-            g_enuCityAlignment = a_Victim.NPC.PoliticalAlignment;
-            g_enuCityPhase = mECityPhase_Watching;
-            g_u32WatchDeadline = u32Now + WATCH_MS;
-            if (g_u32WatchDeadline == 0)
-                g_u32WatchDeadline = 1;
-            StartWatching(Hero, a_Victim);
-        }
-
-        // v1.0.35.0: HARD BLOCK OF THE LOOTING EXPLOIT. A green / neutral resident of a friendly city (reputation 75+) who
-        // falls unconscious (down / ZS_Unconscious) at the hands of the hero is, AT ONCE and without any timer, the SECOND
-        // blow: the 10 s window (WATCH_MS) is ignored, the full crime is declared (StartTotalAggro: every witness in sight
-        // and the guards draw the weapon and attack the hero natively). Called from AssessHit, AssessAgressor, the
-        // knock-out scripts (Defeat) and the damage hook, so no path of the knock-out is missed. Once per victim and fall.
-        void OnCityKnockout(Entity &a_Victim, GELPCChar a_strWhere)
-        {
-            Entity Hero = Entity::GetPlayer();
-            if (a_Victim == None || a_Victim == Hero || !a_Victim.IsNPC() || a_Victim.IsDead())
-                return;
-            // "Fell unconscious": the down flag, the Down AI mode, or one of the native knock-out tasks.
-            GEBool const bDown = a_Victim.IsDown() || a_Victim.Routine.AIMode == gEAIMode_Down ||
-                                 HasTask(a_Victim, "ZS_Unconscious") || HasTask(a_Victim, "ZS_LieKnockDown") ||
-                                 HasTask(a_Victim, "ZS_PiercedKO");
-            if (!bDown)
-                return;
-            if (IsHeroSide(a_Victim) || IsHeroControlled(a_Victim) || !AI_Decision::IsHumanoid(a_Victim))
-                return;
-
-            // The hero (any form) must be the one who knocked him out.
-            Entity Attacker = a_Victim.NPC.GetCurrentAttacker();
-            if (Attacker == None)
-                Attacker = a_Victim.NPC.GetLastAttacker();
-            Entity Inflictor = a_Victim.DamageReceiver.IsValid() ? a_Victim.DamageReceiver.GetLastInflictor() : Entity();
-            GEBool const bByHero = (Attacker != None && IsHeroSide(Attacker)) || IsRememberedAssaultVictim(a_Victim) ||
-                                   (Inflictor != None && IsHeroSide(Inflictor));
-            if (!bByHero)
-                return;
-
-            // v1.0.37.0: THE LAW OF THE CITY. The general exception "the NPC attacked first" is REMOVED (neither the attack
-            // reason nor the attitude of the victim is looked at): a resident of a friendly city who falls unconscious at the
-            // hands of the hero ALWAYS raises the total aggression. Only two legitimate situations are exempt, both read from
-            // the quest manager (the arena quest is Running):
-            //  1. the hero stands inside the ring of the arena;
-            //  2. it is the official duel 1 on 1: the victim is the opponent of the duel quest.
-            if (HasRunningArenaQuest())
-            {
-                if (IsHeroInsideArenaZone())
-                    return;
-                Entity Opponent;
-                if ((FindArenaOpponent(Opponent) || FindRememberedOpponent(Opponent)) && a_Victim == Opponent)
-                    return;
-            }
-
-            GEI32 iEnclaveFame = 0;
-            GEI32 iPoliticalFame = 0;
-            if (!HasHighReputation(a_Victim, iEnclaveFame, iPoliticalFame))
-                return; // below 75 the game reacts by itself
-
-            // v1.0.52.0: THE KNOCK-OUT FROM THE FIRST BLOW IS THE SECOND BLOW (the blind spot of 1.0.51.0, where the witnesses
-            // stayed silent because the counter of the blows had only just been started when the victim already lay down).
-            // OnCityAssault runs BEFORE the original damage code, so by now the first blow is counted (the phase is Watching:
-            // the witnesses stopped and look). A phase that is not a live Aggro here means the knock-out came with the very
-            // first blow: the counter is wound on to the second blow at once, right AFTER it was started (the victim, the
-            // community and the blow time are written as the second blow does), and StartTotalAggro below arms the mercy and
-            // sends every witness (and the guards) at the hero. The victim himself is NOT touched: he lies in the native
-            // knock-out (StartTotalAggro orders nobody who is down), he is not ordered to get up and fight.
-            GEU32 const u32Check = ::GetTickCount();
-            GEBool const bAggroLive = g_enuCityPhase == mECityPhase_Aggro && !TickReached(u32Check, g_u32AggroUntil);
-            GEBool const bFromFirstBlow = !bAggroLive;
-
-            // Once per fall of the same victim.
-            static bCString s_strLastVictim;
-            static GEU32 s_u32LastTick = 0;
-            GEU32 const u32Now = ::GetTickCount();
-            bCString const strVictim = a_Victim.GetName();
-            if (s_u32LastTick != 0 && static_cast<GEInt>(u32Now - s_u32LastTick) < 5000 && s_strLastVictim == strVictim)
-                return;
-            s_strLastVictim = strVictim;
-            s_u32LastTick = u32Now;
-
-            if (bFromFirstBlow)
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Assault: '%s' fell unconscious from the FIRST blow (%s): the "
-                                             "counter is wound on - the knock-out counts as the SECOND blow, the witnesses "
-                                             "attack the hero (Mercy armed), the victim stays down.\n",
-                                             strVictim.GetText(), a_strWhere);
-            else
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Assault: '%s' fell unconscious at the hands of the hero (%s): "
-                                             "counted as the SECOND blow at once, the %u ms window is ignored.\n",
-                                             strVictim.GetText(), a_strWhere, static_cast<unsigned>(WATCH_MS));
-            g_u32BlowTick = u32Now;
-            g_strCityVictim = strVictim;
-            g_strCityEnclave = GetEnclaveName(a_Victim);
-            g_enuCityAlignment = a_Victim.NPC.PoliticalAlignment;
-            g_u32LastAggroPass = u32Now;
-            StartTotalAggro(Hero, a_Victim, bCString(), GETrue, bFromFirstBlow);
-        }
-
-        // Called by the hook of ZS_WatchFight_Loop for the NPC that runs it. True: the watcher was released and has
-        // already got his routine back (the state must not go on).
-        GEBool ReleaseWatcherIfOver(Entity &a_Self)
-        {
-            GEInt const iIndex = FindWatcher(a_Self.GetName());
-            if (iIndex < 0)
-                return GEFalse;
-            GEU32 const u32Now = ::GetTickCount();
-            if (g_enuCityPhase == mECityPhase_Watching && !TickReached(u32Now, g_u32WatchDeadline))
-                return GEFalse;
-
-            RemoveWatcher(iIndex);
-            if (g_iWatchCount == 0 && g_enuCityPhase == mECityPhase_Watching)
-                g_enuCityPhase = mECityPhase_Idle;
-            if (!HasTask(a_Self, "ZS_WatchFight"))
-                return GEFalse;
-            a_Self.NPC.SetCurrentTarget(None);
-            a_Self.NPC.SetAlternativeTarget(None);
-            a_Self.Routine.ContinueRoutine();
-
-            static GEInt s_iReleaseLines = 0;
-            if (s_iReleaseLines < 60)
-            {
-                ++s_iReleaseLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Assault: no second blow within %u ms, '%s' goes back to "
-                                             "his routine (%d watcher(s) left).\n",
-                                             static_cast<unsigned>(WATCH_MS), a_Self.GetName().GetText(),
-                                             static_cast<int>(g_iWatchCount));
-            }
-            return GETrue;
-        }
-
-
-        GEBool IsElementalDamage(gEDamageType a_enuType)
-        {
-            return a_enuType == gEDamageType_Fire || a_enuType == gEDamageType_Ice || a_enuType == gEDamageType_Lightning;
-        }
-
-        // The damage type of a hit. A spell reaches DoLogicalDamage as a projectile / spell container / burning effect:
-        // the elemental type is searched in every link (object itself, its spell, its owner), then the first known type
-        // and finally the type stored on the victim are used.
-        gEDamageType GetHitDamageType(Entity &a_Source, Entity &a_Victim)
-        {
-            gEDamageType enuFirst = gEDamageType_None;
-            Entity Current = a_Source;
-            for (GEInt iLink = 0; iLink < 4 && Current != None; ++iLink)
-            {
-                if (Current.Damage.IsValid())
-                {
-                    gEDamageType const enuType = Current.Damage.DamageType;
-                    if (IsElementalDamage(enuType))
-                        return enuType;
-                    if (enuFirst == gEDamageType_None)
-                        enuFirst = enuType;
-                }
-                if (!Current.Interaction.IsValid())
-                    break;
-
-                Entity Spell = Current.Interaction.GetSpell();
-                if (Spell != None && Spell != Current && Spell.Damage.IsValid() &&
-                    IsElementalDamage(Spell.Damage.DamageType))
-                    return Spell.Damage.DamageType;
-
-                Entity Owner = Current.Interaction.GetOwner();
-                if (Owner == None || Owner == Current)
-                    break;
-                Current = Owner;
-            }
-            if (a_Victim.DamageReceiver.IsValid() && IsElementalDamage(a_Victim.DamageReceiver.DamageType))
-                return a_Victim.DamageReceiver.DamageType;
-            return enuFirst;
-        }
-
-        // The elemental damage type of the damaging object ITSELF (its own chain: object, its spell, its owners). Unlike
-        // GetHitDamageType the type stored on the victim is NOT used: it is the type of the PREVIOUS hit and would let a
-        // sword blow pass as a spell. gEDamageType_None when the object is not elemental.
-        gEDamageType GetSourceElementalType(Entity &a_Source)
-        {
-            // v1.0.34.0: the walk STOPS at the first creature (the owner of the projectile, the hero). His own Damage property
-            // and his own last spell (Interaction.GetSpell) are not the type of THIS projectile: through them an arrow of the
-            // hero was taken for a magic bolt (an elemental weapon / the last cast spell of the hero) and passed the filter.
-            Entity Current = a_Source;
-            for (GEInt iLink = 0; iLink < 4 && Current != None; ++iLink)
-            {
-                if (Current.IsNPC() || IsHeroSide(Current))
-                    break;
-                if (Current.Damage.IsValid() && IsElementalDamage(Current.Damage.DamageType))
-                    return Current.Damage.DamageType;
-                if (!Current.Interaction.IsValid())
-                    break;
-                Entity Spell = Current.Interaction.GetSpell();
-                if (Spell != None && Spell != Current && Spell.Damage.IsValid() && IsElementalDamage(Spell.Damage.DamageType))
-                    return Spell.Damage.DamageType;
-                Entity Owner = Current.Interaction.GetOwner();
-                if (Owner == None || Owner == Current)
-                    break;
-                Current = Owner;
-            }
-            return gEDamageType_None;
-        }
 
         //
         // DIAGNOSTICS v1.0.20.0 (reads only, nothing is written, no behaviour is changed).
@@ -1959,155 +853,8 @@ namespace RequirementsCheck
             }
         }
 
-        // The hero in any form: the player entity, the body of the form, the hidden human body.
-        GEBool IsHeroSide(Entity &a_Npc)
-        {
-            if (a_Npc == None)
-                return GEFalse;
-            if (a_Npc == Entity::GetPlayer() || IsHeroFormEntity(a_Npc))
-                return GETrue;
-            return _stricmp(a_Npc.GetName().GetText(), "PC_Hero") == 0 ? GETrue : GEFalse;
-        }
 
-        void LogAiSnapshot(GELPCChar a_strWhen, Entity &a_Npc)
-        {
-            Entity Hero = Entity::GetPlayer();
-            Entity Leader = a_Npc.Party.GetPartyLeader();
-            Entity Target = a_Npc.NPC.GetCurrentTarget();
-            Entity Attacker = a_Npc.NPC.GetCurrentAttacker();
-            bCString const strTask = a_Npc.Routine.GetCurrentTask();
-            bCString const strState = a_Npc.Routine.GetCurrentState();
-            GetDefaultLogger().LogFormat(
-                "[GenomeLogicFix][diag][flee] %s: '%s' (%p, party type %d, leader '%s', waiting=%d) task='%s' state='%s' "
-                "aiMode=%d attackReason=%d combatState=%u target='%s' currentAttacker='%s' distToHero=%.0f dead=%d "
-                "down=%d\n",
-                a_strWhen, a_Npc.GetName().GetText(), static_cast<void *>(a_Npc.GetInstance()),
-                static_cast<int>(a_Npc.Party.PartyMemberType), Leader != None ? Leader.GetName().GetText() : "-",
-                static_cast<int>(a_Npc.Party.Waiting), strTask.GetText(), strState.GetText(),
-                static_cast<int>(a_Npc.Routine.AIMode), static_cast<int>(a_Npc.NPC.AttackReason),
-                static_cast<unsigned>(a_Npc.NPC.CombatState), Target != None ? Target.GetName().GetText() : "-",
-                Attacker != None ? Attacker.GetName().GetText() : "-",
-                static_cast<double>(Hero != None ? a_Npc.GetDistanceTo(Hero) : -1.0f),
-                static_cast<int>(a_Npc.IsDead()), static_cast<int>(a_Npc.IsDown()));
-        }
-        GEInt const FLEE_WATCH_MAX = 8;
-        GEInt const FLEE_STAGES = 4;
-        GEU32 const g_arrFleeOffsets[FLEE_STAGES] = {300, 1000, 2000, 4000};
-        bCString g_arrFleeNames[FLEE_WATCH_MAX];
-        GEU32 g_arrFleeStart[FLEE_WATCH_MAX] = {};
-        GEInt g_arrFleeStage[FLEE_WATCH_MAX] = {};
-        GEBool g_bFleeWatchActive = GEFalse;
 
-        void StartFleeWatch(Entity &a_Victim)
-        {
-            bCString const strName = a_Victim.GetName();
-            GEInt iSlot = -1;
-            for (GEInt i = 0; i < FLEE_WATCH_MAX; ++i)
-            {
-                if (g_arrFleeStart[i] != 0 && g_arrFleeNames[i] == strName)
-                {
-                    iSlot = i; // hit again: the watch starts anew
-                    break;
-                }
-                if (iSlot < 0 && g_arrFleeStart[i] == 0)
-                    iSlot = i;
-            }
-            if (iSlot < 0)
-                iSlot = 0;
-            g_arrFleeNames[iSlot] = strName;
-            g_arrFleeStart[iSlot] = ::GetTickCount() | 1;
-            g_arrFleeStage[iSlot] = 0;
-            g_bFleeWatchActive = GETrue;
-        }
-
-        // Called from the hooks that run all the time (attitude / target). Technically throttled, reads only.
-        void PollBrawl();                                // defined below (v1.0.30.0)
-        void ReleaseStumbledNpc(Entity &a_Npc);          // defined below
-        void BrawlStageAction(Entity &a_Npc, GEInt a_iStage); // defined below
-        void OnHeroBlowOnArmy(Entity &a_Victim);         // defined below
-        void PollFleeWatch()
-        {
-            PollBrawl();
-            if (!g_bFleeWatchActive)
-                return;
-            static GEU32 s_u32Last = 0;
-            GEU32 const u32Now = ::GetTickCount();
-            if (s_u32Last != 0 && static_cast<GEInt>(u32Now - s_u32Last) < 100)
-                return;
-            s_u32Last = u32Now;
-            GEBool bAny = GEFalse;
-            for (GEInt i = 0; i < FLEE_WATCH_MAX; ++i)
-            {
-                if (g_arrFleeStart[i] == 0)
-                    continue;
-                GEInt const iStage = g_arrFleeStage[i];
-                if (iStage >= FLEE_STAGES)
-                {
-                    g_arrFleeStart[i] = 0;
-                    continue;
-                }
-                bAny = GETrue;
-                GEU32 const u32Elapsed = u32Now - g_arrFleeStart[i];
-                if (static_cast<GEInt>(u32Elapsed) < static_cast<GEInt>(g_arrFleeOffsets[iStage]))
-                    continue;
-                g_arrFleeStage[i] = iStage + 1;
-                bTObjArray<Entity> arrNPCs = Entity::GetNPCs();
-                for (GEInt k = 0; k < arrNPCs.GetCount(); ++k)
-                {
-                    Entity Npc = arrNPCs.GetAt(k);
-                    if (!(Npc.GetName() == g_arrFleeNames[i]))
-                        continue;
-                    char strWhen[64] = {};
-                    _snprintf_s(strWhen, sizeof(strWhen), _TRUNCATE, "+%u ms after the blow of the hero",
-                                static_cast<unsigned>(u32Elapsed));
-                    LogAiSnapshot(strWhen, Npc);
-                    if (iStage >= 1 && IsHeroControlled(Npc) && HasTask(Npc, "ZS_Stumble"))
-                    {
-                        ReleaseStumbledNpc(Npc); // THE SAFETY NET: an army member left in ZS_Stumble about 1 s after a blow is released
-                        GetDefaultLogger().LogFormat("[GenomeLogicFix] '%s' was stuck in ZS_Stumble after a blow: released.\n",
-                                                     Npc.GetName().GetText());
-                    }
-                    BrawlStageAction(Npc, iStage);
-                    break;
-                }
-            }
-            if (!bAny)
-                g_bFleeWatchActive = GEFalse;
-        }
-        // One line per blow on a member of the army. a_strFunction: the native function that recorded the blow.
-        // a_pSource may be the damaging object (projectile) - the owner chain gives the real attacker.
-        void LogArmyHit(GELPCChar a_strFunction, Entity &a_Victim, Entity &a_Source, GEInt a_iDamageType)
-        {
-            static GEInt s_iLines = 0;
-            if (s_iLines >= 600 || a_Victim == None || !a_Victim.IsNPC())
-                return;
-            if (!IsHeroControlled(a_Victim))
-                return;
-            Entity Attacker = GetDamageOwnerNpc(a_Source);
-            if (Attacker == None)
-                Attacker = a_Source;
-            Entity Hero = Entity::GetPlayer();
-            GEBool const bHeroSide = Attacker != None && IsHeroSide(Attacker);
-            GEBool const bArmy = Attacker != None && IsHeroControlled(Attacker);
-            GELPCChar strKind = bHeroSide ? "HERO" : (bArmy ? "ARMY" : "OUTSIDER");
-            ++s_iLines;
-            GetDefaultLogger().LogFormat(
-                "[GenomeLogicFix][diag][hit] %s: attacker='%s' (%p, %s, faction %d, party type %d) -> victim='%s' (%p, "
-                "party type %d) damage=%s(%d) source object='%s' hero(GetPlayer)='%s'\n",
-                a_strFunction, Attacker != None ? Attacker.GetName().GetText() : "-",
-                Attacker != None ? static_cast<void *>(Attacker.GetInstance()) : nullptr, strKind,
-                Attacker != None && Attacker.IsNPC() ? static_cast<int>(Attacker.NPC.PoliticalAlignment) : -1,
-                Attacker != None && Attacker.IsNPC() ? static_cast<int>(Attacker.Party.PartyMemberType) : -1,
-                a_Victim.GetName().GetText(), static_cast<void *>(a_Victim.GetInstance()),
-                static_cast<int>(a_Victim.Party.PartyMemberType), DamageTypeName(a_iDamageType), a_iDamageType,
-                a_Source != None ? a_Source.GetName().GetText() : "-", Hero.GetName().GetText());
-            // The hero (in any form) hurts his own creature: the AI is watched for the next seconds.
-            if (bHeroSide)
-            {
-                LogAiSnapshot("right after the blow of the hero", a_Victim);
-                StartFleeWatch(a_Victim);
-            }
-        }
 
         //
         // COMBAT RECORDS (v1.0.25.0). The native rules of the army: a creature of the party fights an outsider only after a
@@ -2118,54 +865,10 @@ namespace RequirementsCheck
         //  - hero hit record: the name of a creature of the army that the HERO himself (any form) has struck: for a while the
         //    plugin does not stand between it and the hero, the native counter of the blows / the brawl decides.
         //
-        GEInt const REC_MAX = 32;
-        GEU32 const COMBAT_MS = 60000;
-        bCString g_arrCombatNames[REC_MAX];
-        GEU32 g_arrCombatTick[REC_MAX] = {};
 
-        void NoteName(bCString *a_pNames, GEU32 *a_pTicks, bCString const &a_strName, GEU32 a_u32Span)
-        {
-            GEU32 const u32Now = ::GetTickCount();
-            GEInt iFree = -1;
-            for (GEInt i = 0; i < REC_MAX; ++i)
-            {
-                if (a_pTicks[i] != 0 && a_pNames[i] == a_strName)
-                {
-                    a_pTicks[i] = u32Now | 1;
-                    return;
-                }
-                if (iFree < 0 && (a_pTicks[i] == 0 || static_cast<GEInt>(u32Now - a_pTicks[i]) >= static_cast<GEInt>(a_u32Span)))
-                    iFree = i;
-            }
-            if (iFree < 0)
-                iFree = 0;
-            a_pNames[iFree] = a_strName;
-            a_pTicks[iFree] = u32Now | 1;
-        }
 
-        GEBool HasName(bCString const *a_pNames, GEU32 const *a_pTicks, bCString const &a_strName, GEU32 a_u32Span)
-        {
-            GEU32 const u32Now = ::GetTickCount();
-            for (GEInt i = 0; i < REC_MAX; ++i)
-                if (a_pTicks[i] != 0 && a_pNames[i] == a_strName &&
-                    static_cast<GEInt>(u32Now - a_pTicks[i]) < static_cast<GEInt>(a_u32Span))
-                    return GETrue;
-            return GEFalse;
-        }
 
-        void ClearCombatRecords()
-        {
-            for (GEInt i = 0; i < REC_MAX; ++i)
-            {
-                g_arrCombatNames[i] = bCString();
-                g_arrCombatTick[i] = 0;
-            }
-        }
 
-        GEBool HasCombatRecord(Entity &a_Outsider)
-        {
-            return HasName(g_arrCombatNames, g_arrCombatTick, a_Outsider.GetName(), COMBAT_MS);
-        }
 
         //
         // THE BRAWL OF THE HERO WITH A MEMBER OF HIS OWN ARMY (v1.0.30.0): the behaviour of an ordinary "green" NPC.
@@ -2179,234 +882,7 @@ namespace RequirementsCheck
         //    in). When the hero is knocked out nobody loots him and nobody finishes him (LeaveMasterAlone); the fight ends
         //    and the creature goes back to the routine of following (PollBrawl).
         //
-        GEInt const BRAWL_MAX = 8;
-        GEU32 const BRAWL_WINDOW_MS = 10000; // the second blow must come within this time, otherwise the counter is reset
-        GEU32 const BRAWL_MAX_MS = 90000;    // a fight never lasts longer than this
-        GEU32 const BLOW_DEBOUNCE_MS = 1200; // the burning ticks of one fireball are NOT a second blow: counted once
-        bCString g_arrBrawlNames[BRAWL_MAX];
-        GEInt g_arrBrawlCount[BRAWL_MAX] = {};
-        GEU32 g_arrBrawlLastBlow[BRAWL_MAX] = {}; // 0: the slot is free
-        GEU32 g_arrBrawlStart[BRAWL_MAX] = {};    // 0: the creature does not fight the hero
-
-        GEBool g_arrBrawlReacted[BRAWL_MAX] = {}; // the reaction of a green NPC to the first blow has been made
-        GEU32 g_arrBrawlCastSeq[BRAWL_MAX] = {};  // the number of the cast of the first blow (the second blow = a NEW cast)
         GEU32 g_u32HeroCastSeq = 0;               // counts the casts of the hero (PSNpc::SetLastCast)
-
-        GEInt FindBrawlSlot(bCString const &a_strName, GEBool a_bCreate)
-        {
-            GEU32 const u32Now = ::GetTickCount();
-            GEInt iFree = -1;
-            for (GEInt i = 0; i < BRAWL_MAX; ++i)
-            {
-                if (g_arrBrawlLastBlow[i] != 0 && g_arrBrawlNames[i] == a_strName)
-                    return i;
-                GEBool const bExpired = g_arrBrawlLastBlow[i] == 0 ||
-                                        (g_arrBrawlStart[i] == 0 && static_cast<GEInt>(u32Now - g_arrBrawlLastBlow[i]) >
-                                                                        static_cast<GEInt>(BRAWL_WINDOW_MS));
-                if (iFree < 0 && bExpired)
-                    iFree = i;
-            }
-            if (!a_bCreate)
-                return -1;
-            if (iFree < 0)
-                iFree = 0;
-            g_arrBrawlNames[iFree] = a_strName;
-            g_arrBrawlCount[iFree] = 0;
-            g_arrBrawlStart[iFree] = 0;
-            g_arrBrawlLastBlow[iFree] = 0;
-            g_arrBrawlReacted[iFree] = GEFalse;
-            g_arrBrawlCastSeq[iFree] = 0;
-            return iFree;
-        }
-
-        void ClearBrawls()
-        {
-            for (GEInt i = 0; i < BRAWL_MAX; ++i)
-            {
-                g_arrBrawlNames[i] = bCString();
-                g_arrBrawlCount[i] = 0;
-                g_arrBrawlLastBlow[i] = 0;
-                g_arrBrawlStart[i] = 0;
-                g_arrBrawlReacted[i] = GEFalse;
-                g_arrBrawlCastSeq[i] = 0;
-            }
-        }
-
-        // v1.0.51.0: THE CLEAN SLATE (called by the event "Mercy ended"). Every memory of the blows of the hero is dropped for
-        // EVERY NPC of the location: the phase / victim / timers of the city beating (the FIRST / SECOND blow of the residents),
-        // the watchers, the memory of the assault, the counters of the brawl of the army (blow count, started fight, reaction),
-        // the blow watch, the records of the fights. The NPCs that still watch the old beating (ZS_WatchFight) get their
-        // routine back first - the native loop never ends by itself. The list of the NPCs sent against the hero (g_arrAggro*)
-        // and the release flag are NOT touched: the same event calms those down in ZS_Attack_Loop. The next blow is the first one.
-        void ResetBlowHistory(GELPCChar a_strWhy)
-        {
-            GEInt iReleased = 0;
-            if (g_iWatchCount > 0)
-            {
-                bTObjArray<Entity> arrNPCs = Entity::GetNPCs();
-                for (GEInt i = 0; i < arrNPCs.GetCount(); ++i)
-                {
-                    Entity Npc = arrNPCs.GetAt(i);
-                    if (Npc == None || !Npc.IsNPC() || Npc.IsDead() || !IsWatcher(Npc) || !HasTask(Npc, "ZS_WatchFight"))
-                        continue;
-                    Npc.NPC.SetCurrentTarget(None);
-                    Npc.NPC.SetAlternativeTarget(None);
-                    Npc.Routine.ContinueRoutine();
-                    ++iReleased;
-                }
-            }
-
-            g_enuCityPhase = mECityPhase_Idle;
-            g_strCityVictim = bCString();
-            g_strCityEnclave = bCString();
-            g_enuCityAlignment = gEPoliticalAlignment_None;
-            g_u32WatchDeadline = 0;
-            g_u32AggroUntil = 0;
-            g_u32BlowTick = 0;
-            g_u32LastAggroPass = 0;
-            g_u32LastDeclare = 0;
-            g_iWatchCount = 0;
-            for (GEInt i = 0; i < WATCH_MAX; ++i)
-                g_arrWatchNames[i] = bCString();
-            g_strAssaultVictim = bCString();
-            g_u32AssaultUntil = 0;
-
-            ClearBrawls();
-            for (GEInt i = 0; i < FLEE_WATCH_MAX; ++i)
-            {
-                g_arrFleeNames[i] = bCString();
-                g_arrFleeStart[i] = 0;
-                g_arrFleeStage[i] = 0;
-            }
-            g_bFleeWatchActive = GEFalse;
-            ClearFocusRecords();
-            ClearCombatRecords();
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Blow history reset (%s): FIRST / SECOND blow counters of all NPCs, the "
-                                         "city beating and its watchers (%d released) are cleared.\n",
-                                         a_strWhy, static_cast<int>(iReleased));
-        }
-
-        // THE UNCONDITIONAL RESET OF THE COMBAT STATE (knock-out of the master, time-out, the end of the fight). Nothing of the
-        // fight is left on the creature, so it cannot hang in an unnatural pose: no target (the combat focus), no attacker,
-        // no alternative target, no attack reason, no combat state; the routine is stopped and the creature is put back to
-        // the peaceful task of following the hero (ContinueRoutine picks the native one, ZS_FollowPlayer is set by hand when
-        // the routine has not left the combat / stumble task). A waiting creature keeps waiting.
-        void ResetCombatState(Entity &a_Npc)
-        {
-            a_Npc.Routine.FullStop();
-            a_Npc.NPC.SetCurrentTarget(None);
-            a_Npc.NPC.SetCurrentAttacker(None);
-            a_Npc.NPC.SetLastAttacker(None);
-            a_Npc.NPC.SetAlternativeTarget(None);
-            a_Npc.NPC.AttackReason = gEAttackReason_None;
-            a_Npc.NPC.CombatState = 0;
-            a_Npc.Routine.ContinueRoutine();
-            // Forced back to the peaceful task of following (a creature that was told to wait keeps waiting).
-            if (!a_Npc.Party.Waiting)
-                a_Npc.Routine.SetTask("ZS_FollowPlayer");
-        }
-
-        // The fight of this creature with the hero is over: the slot is closed and the combat state is reset.
-        void EndBrawlOf(Entity &a_Npc, GELPCChar a_strWhy)
-        {
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] The brawl of '%s' with his master is over (%s): the combat state is "
-                                         "reset, back to the routine of following.\n",
-                                         a_Npc.GetName().GetText(), a_strWhy);
-            GEInt const iSlot = FindBrawlSlot(a_Npc.GetName(), GEFalse);
-            if (iSlot >= 0)
-            {
-                g_arrBrawlStart[iSlot] = 0;
-                g_arrBrawlCount[iSlot] = 0;
-                g_arrBrawlLastBlow[iSlot] = 0;
-                g_arrBrawlReacted[iSlot] = GEFalse;
-            }
-            ResetCombatState(a_Npc);
-        }
-
-        GEBool IsBrawlFighting(Entity &a_Npc)
-        {
-            GEInt const iSlot = FindBrawlSlot(a_Npc.GetName(), GEFalse);
-            return iSlot >= 0 && g_arrBrawlStart[iSlot] != 0;
-        }
-
-        // The SAFETY NET against a creature stuck in ZS_Stumble after a blow of the hero (it is called by PollFleeWatch about
-        // one second after the blow). A creature that has accepted the fight goes on attacking the hero, any other one
-        // goes back to the routine.
-        void ReleaseStumbledNpc(Entity &a_Npc)
-        {
-            a_Npc.Routine.FullStop();
-            if (IsBrawlFighting(a_Npc) && !IsHeroKnockedOut())
-            {
-                a_Npc.NPC.SetCurrentTarget(Entity::GetPlayer());
-                a_Npc.NPC.AttackReason = gEAttackReason_Angry;
-                a_Npc.Routine.SetTask("ZS_Attack");
-                return;
-            }
-            a_Npc.NPC.SetCurrentTarget(None);
-            a_Npc.Routine.ContinueRoutine();
-        }
-
-        // THE MASTER IS KNOCKED OUT: a creature of his party that fights him (or still keeps him as a target) stops at once
-        // and goes back to the routine of following. Nobody of the party finishes, robs or hits the fallen master.
-        // Returns true when the creature was released.
-        GEBool StandDownFromMaster(Entity &a_Npc, GELPCChar a_strWhere)
-        {
-            if (a_Npc == None || !a_Npc.IsNPC() || !IsHeroControlled(a_Npc) || !IsHeroKnockedOut())
-                return GEFalse;
-            // Fighting the master in any way: a started brawl, the master as the target or as the current attacker.
-            Entity Target = a_Npc.NPC.GetCurrentTarget();
-            Entity Attacker = a_Npc.NPC.GetCurrentAttacker();
-            GEBool const bAgainstMaster = IsBrawlFighting(a_Npc) || (Target != None && IsHeroSide(Target)) ||
-                                          (Attacker != None && IsHeroSide(Attacker));
-            if (!bAgainstMaster)
-                return GEFalse;
-            EndBrawlOf(a_Npc, a_strWhere);
-            return GETrue;
-        }
-
-        // A blow of the hero (any form) on a member of his army has passed (called from RecordCombat).
-        void OnHeroBlowOnArmy(Entity &a_Victim)
-        {
-            if (a_Victim == None || !a_Victim.IsNPC() || a_Victim.IsDead() || a_Victim.IsDown() || IsHeroKnockedOut())
-                return;
-            GEU32 const u32Now = ::GetTickCount();
-            GEInt const iSlot = FindBrawlSlot(a_Victim.GetName(), GETrue);
-            if (g_arrBrawlLastBlow[iSlot] != 0 &&
-                static_cast<GEInt>(u32Now - g_arrBrawlLastBlow[iSlot]) < static_cast<GEInt>(BLOW_DEBOUNCE_MS))
-                return; // the same blow, seen by another hook
-            // THE WINDOW OF THE SECOND BLOW: no second blow within BRAWL_WINDOW_MS (10 s) of the first one - the counter is reset
-            // and the creature cools down (this blow is the FIRST one again).
-            if (g_arrBrawlStart[iSlot] == 0 &&
-                (g_arrBrawlLastBlow[iSlot] == 0 || static_cast<GEInt>(u32Now - g_arrBrawlLastBlow[iSlot]) >
-                                                       static_cast<GEInt>(BRAWL_WINDOW_MS)))
-            {
-                g_arrBrawlCount[iSlot] = 0;
-                g_arrBrawlReacted[iSlot] = GEFalse;
-            }
-            // The burning / freezing after ONE cast are no second blow: the second blow is a NEW cast of the hero.
-            if (g_arrBrawlStart[iSlot] == 0 && g_arrBrawlCount[iSlot] == 1 && g_arrBrawlCastSeq[iSlot] == g_u32HeroCastSeq)
-                return;
-            if (g_arrBrawlCount[iSlot] == 0)
-                g_arrBrawlCastSeq[iSlot] = g_u32HeroCastSeq;
-            g_arrBrawlLastBlow[iSlot] = u32Now | 1;
-            ++g_arrBrawlCount[iSlot];
-            StartFleeWatch(a_Victim); // the watch makes the reaction to the first blow and keeps the safety net
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Blow %d of the hero on '%s' (party type %d).\n",
-                                         static_cast<int>(g_arrBrawlCount[iSlot]), a_Victim.GetName().GetText(),
-                                         static_cast<int>(a_Victim.Party.PartyMemberType));
-            if (g_arrBrawlCount[iSlot] < 2 || g_arrBrawlStart[iSlot] != 0)
-                return;
-            // THE SECOND BLOW: the creature accepts the fight and attacks the hero.
-            g_arrBrawlStart[iSlot] = u32Now | 1;
-            Entity Hero = Entity::GetPlayer();
-            a_Victim.Routine.FullStop();
-            a_Victim.NPC.SetCurrentTarget(Hero);
-            a_Victim.NPC.AttackReason = gEAttackReason_Angry;
-            a_Victim.Routine.SetTask("ZS_Attack");
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] The second blow: '%s' accepts the fight and attacks the hero "
-                                         "('%s'). The rest of the army stays neutral.\n",
-                                         a_Victim.GetName().GetText(), Hero.GetName().GetText());
-        }
 
         // The fights are watched here (throttled): the hero knocked out / the creature down / the time over ends the fight;
         // while it goes on the timer "the hero struck" is kept alive (the master block stays off for this creature only).
@@ -2477,152 +953,12 @@ namespace RequirementsCheck
                 Npc.Routine.SetTask("ZS_FollowPlayer");
                 ++iReleased;
             }
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] The arena quest is not running any more: %d waiting companion(s) of the arena "
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix] The arena quest is not running any more: %d waiting companion(s) of the arena "
                                          "session follow the hero again (ZS_FollowPlayer), %d other waiter(s) are left as they are.\n",
                                          static_cast<int>(iReleased), static_cast<int>(iKept));
         }
 
-        void PollBrawl()
-        {
-            PollArenaQuestEnd();
-            GEBool bAny = GEFalse;
-            for (GEInt i = 0; i < BRAWL_MAX; ++i)
-                if (g_arrBrawlStart[i] != 0 || g_arrBrawlLastBlow[i] != 0)
-                    bAny = GETrue;
-            if (!bAny)
-                return;
-            static GEU32 s_u32Last = 0;
-            GEU32 const u32Now = ::GetTickCount();
-            if (s_u32Last != 0 && static_cast<GEInt>(u32Now - s_u32Last) < 250)
-                return;
-            s_u32Last = u32Now;
-            GEBool const bHeroDown = IsHeroKnockedOut();
-            bTObjArray<Entity> arrNPCs = Entity::GetNPCs();
-            for (GEInt i = 0; i < BRAWL_MAX; ++i)
-            {
-                // THE COOL-DOWN: the first blow was borne and no second blow came within BRAWL_WINDOW_MS (10 s) - the counter
-                // is reset, the combat state of the creature is cleared and it goes back to following the hero.
-                if (g_arrBrawlStart[i] == 0 && g_arrBrawlLastBlow[i] != 0 &&
-                    (bHeroDown || static_cast<GEInt>(u32Now - g_arrBrawlLastBlow[i]) > static_cast<GEInt>(BRAWL_WINDOW_MS)))
-                {
-                    for (GEInt k = 0; k < arrNPCs.GetCount(); ++k)
-                    {
-                        Entity Npc = arrNPCs.GetAt(k);
-                        if (!(Npc.GetName() == g_arrBrawlNames[i]))
-                            continue;
-                        if (!Npc.IsDead() && !Npc.IsDown())
-                            EndBrawlOf(Npc, bHeroDown ? "the master is knocked out" : "no second blow within 10 s: cooled down");
-                        break;
-                    }
-                    g_arrBrawlCount[i] = 0;
-                    g_arrBrawlLastBlow[i] = 0;
-                    g_arrBrawlReacted[i] = GEFalse;
-                    continue;
-                }
-                if (g_arrBrawlStart[i] == 0)
-                    continue;
-                GEBool const bTimeOver =
-                    static_cast<GEInt>(u32Now - g_arrBrawlStart[i]) > static_cast<GEInt>(BRAWL_MAX_MS);
-                GEBool bFound = GEFalse;
-                for (GEInt k = 0; k < arrNPCs.GetCount(); ++k)
-                {
-                    Entity Npc = arrNPCs.GetAt(k);
-                    if (!(Npc.GetName() == g_arrBrawlNames[i]))
-                        continue;
-                    bFound = GETrue;
-                    GEBool const bOut = Npc.IsDead() || Npc.IsDown();
-                    if (bHeroDown || bTimeOver || bOut)
-                    {
-                        if (!bOut)
-                            EndBrawlOf(Npc, bHeroDown ? "the master is knocked out" : "time is over");
-                        bFound = GEFalse; // the slot is closed below
-                    }
-                    break;
-                }
-                if (!bFound)
-                {
-                    g_arrBrawlStart[i] = 0;
-                    g_arrBrawlCount[i] = 0;
-                    g_arrBrawlLastBlow[i] = 0;
-                    g_arrBrawlReacted[i] = GEFalse;
-                }
-            }
-        }
 
-        // Called by the blow watch (PollFleeWatch) after the stumble release; a_iStage 0 is +300 ms, 1 is +1000 ms,
-        // 2 is +2000 ms, 3 is +4000 ms after the last blow of the hero.
-        void BrawlStageAction(Entity &a_Npc, GEInt a_iStage)
-        {
-            if (!IsHeroControlled(a_Npc) || a_Npc.IsDead() || a_Npc.IsDown() || IsHeroKnockedOut())
-                return;
-            GEInt const iSlot = FindBrawlSlot(a_Npc.GetName(), GEFalse);
-            if (iSlot < 0 || g_arrBrawlStart[iSlot] != 0)
-                return;
-            Entity Hero = Entity::GetPlayer();
-            if (Hero == None)
-                return;
-            if (a_iStage <= 1 && !g_arrBrawlReacted[iSlot] && g_arrBrawlCount[iSlot] == 1 &&
-                !HasTask(a_Npc, "ZS_Stumble") && !HasTask(a_Npc, "ZS_Attack"))
-            {
-                // THE FIRST BLOW: the reaction of an ordinary green NPC (the weapon, the stance, the manoeuvring in front of
-                // the hero, one on one). A stumble in progress is let finish (stage 0) or was released (stage 1).
-                g_arrBrawlReacted[iSlot] = GETrue;
-                if (!HasTask(a_Npc, "ZS_ReactToDamage"))
-                {
-                    a_Npc.Routine.FullStop();
-                    a_Npc.NPC.SetCurrentTarget(Hero);
-                    a_Npc.NPC.AttackReason = gEAttackReason_ReactToDamage;
-                    a_Npc.Routine.SetTask("ZS_ReactToDamage");
-                }
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] The first blow: '%s' reacts as a green NPC (ZS_ReactToDamage "
-                                             "in front of the hero, one on one).\n",
-                                             a_Npc.GetName().GetText());
-            }
-            else if (a_iStage == 3 && !HasTask(a_Npc, "ZS_Attack") && !HasTask(a_Npc, "ZS_ReactToDamage") &&
-                     !HasTask(a_Npc, "ZS_FollowPlayer") && !a_Npc.Party.Waiting && a_Npc.GetDistanceTo(Hero) > 900.0f)
-            {
-                // THE ENDLESS RETREAT is stopped: he is far from the hero and still does not follow him.
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] '%s' retreated too far (%.0f) after the blow: back to the "
-                                             "hero.\n",
-                                             a_Npc.GetName().GetText(), static_cast<double>(a_Npc.GetDistanceTo(Hero)));
-                a_Npc.Routine.FullStop();
-                a_Npc.NPC.SetCurrentTarget(None);
-                a_Npc.NPC.AttackReason = gEAttackReason_None;
-                a_Npc.Routine.ContinueRoutine();
-            }
-        }
-
-        // The engine stored a_Attacker as the attacker of a_Victim: a real blow.
-        void RecordCombat(Entity &a_Victim, Entity &a_Attacker)
-        {
-            if (a_Victim == None || a_Attacker == None || a_Victim == a_Attacker)
-                return;
-            // THE HERO (any form) HIT A MEMBER OF HIS OWN ARMY: the manual two-stage counter of the brawl counts the blow (the
-            // first one is borne, the second one within BRAWL_WINDOW_MS starts the fight). Both are of "the hero's side", so
-            // this comes before the same-side exit below.
-            if (IsHeroSide(a_Attacker) && IsHeroControlled(a_Victim))
-            {
-                OnHeroBlowOnArmy(a_Victim);
-                return;
-            }
-            GEBool const bVictimSide = IsHeroSide(a_Victim) || IsHeroControlled(a_Victim);
-            GEBool const bAttackerSide = IsHeroSide(a_Attacker) || IsHeroControlled(a_Attacker);
-            if (bVictimSide == bAttackerSide)
-                return;
-            Entity &Outsider = bVictimSide ? a_Attacker : a_Victim;
-            if (IsDuelTaboo(Outsider))
-                return; // the duel opponent never becomes an enemy of the army
-            if (Outsider.IsNPC())
-                NoteName(g_arrCombatNames, g_arrCombatTick, Outsider.GetName(), COMBAT_MS);
-        }
-
-        // The attack reasons that do not need a record: the command of the player, the arena, the duel, the revolution, prey.
-        GEBool IsOrderedAttackReason(GEInt a_iReason)
-        {
-            return a_iReason == gEAttackReason_PlayerCommand || a_iReason == gEAttackReason_Arena ||
-                   a_iReason == gEAttackReason_Duel || a_iReason == gEAttackReason_Revolution ||
-                   a_iReason == gEAttackReason_Prey;
-        }
 
         // THE TABOO OF THE DUEL. While the duel / arena quest is Running, the one NPC who fights the hero in it (attack
         // reason Arena / Duel, or the opponent remembered by name when his reason has already changed) is invisible for the
@@ -2660,60 +996,14 @@ namespace RequirementsCheck
             }
             return GEFalse;
         }
-        // THE FIGHT HAS STARTED. An outsider (not the hero, not of the army) and a creature of the army (or the hero) are in
-        // a real fight when the engine has written one down as the attacker of the other, or when the combat record of the
-        // outsider exists (SetCurrentAttacker / SetLastAttacker recorded a real blow).
-        GEBool IsInRealFight(Entity &a_Self, Entity &a_Other)
-        {
-            if (a_Self == None || a_Other == None)
-                return GEFalse;
-            Entity *pArmy = nullptr;
-            Entity *pOutsider = nullptr;
-            if (IsHeroControlled(a_Self) && a_Other.IsNPC() && !IsHeroSide(a_Other) && !IsHeroControlled(a_Other))
-            {
-                pArmy = &a_Self;
-                pOutsider = &a_Other;
-            }
-            else if (IsHeroControlled(a_Other) && a_Self.IsNPC() && !IsHeroSide(a_Self) && !IsHeroControlled(a_Self))
-            {
-                pArmy = &a_Other;
-                pOutsider = &a_Self;
-            }
-            if (!pArmy || !pOutsider)
-                return GEFalse;
-            return HasCombatRecord(*pOutsider) || pArmy->NPC.GetCurrentAttacker() == *pOutsider ||
-                           pArmy->NPC.GetLastAttacker() == *pOutsider || pOutsider->NPC.GetCurrentAttacker() == *pArmy ||
-                           pOutsider->NPC.GetLastAttacker() == *pArmy
-                       ? GETrue
-                       : GEFalse;
-        }
-        // A creature of the army must not take an outsider for a target while there is no real fight with him.
-        GEBool ArmyMustNotAttack(Entity &a_Self, Entity &a_Other, GEInt a_iReason)
-        {
-            if (a_Self == None || a_Other == None || !a_Other.IsNPC() || !IsHeroControlled(a_Self))
-                return GEFalse;
-            if (IsDuelTaboo(a_Other))
-                return GETrue; // the duel opponent is invisible for the army, whatever the reason
-            if (IsHeroSide(a_Other) || IsHeroControlled(a_Other) || IsOrderedAttackReason(a_iReason))
-                return GEFalse;
-            if (HasCombatRecord(a_Other) || a_Self.NPC.GetCurrentAttacker() == a_Other || a_Self.NPC.GetLastAttacker() == a_Other)
-                return GEFalse;
-            return GETrue;
-        }
+
+
 
     } // namespace
 
     namespace
     {
-        // v1.0.34.0: a blocked blow leaves NO trace in the health bar. The hit points are taken off by the native script
-        // AssessHit (it writes PSDamageReceiver::DamageAmount and calls AddHitPoints / SetHitPoints), and every blocked path
-        // returns BEFORE the original script runs. The pending DamageAmount is also reset to 0, so a stale amount of an
-        // earlier hit can never be applied to the companion by anything that reads it later.
-        void ZeroPendingDamage(Entity &a_Victim)
-        {
-            if (a_Victim != None && a_Victim.DamageReceiver.IsValid())
-                a_Victim.DamageReceiver.DamageAmount = 0;
-        }
+
     } // namespace
 
     // The one hook for the arena magic and the city assaults: DoLogicalDamage is the choke point of every hit
@@ -2722,115 +1012,9 @@ namespace RequirementsCheck
     // unless the damaging object is explicitly owned by the opponent himself. So no fragile "who created the projectile"
     // chain is needed there. Freezing / igniting is also detected by the state of the opponent (IsFrozen / IsBurning)
     // before and after the original, because the status is applied inside AssessHit.
-    ME_DEFINE_AND_HOOK_SCRIPT(DoLogicalDamage)
+        ME_DEFINE_AND_HOOK_SCRIPT(DoLogicalDamage)
     {
-        Entity Victim = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-        Entity Source = ResolveEntity(a_pOtherEntity, a_pSPU->GetOtherEntity());
-
-        static GEBool s_bAliveLogged = GEFalse;
-        if (!s_bAliveLogged)
-        {
-            s_bAliveLogged = GETrue;
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] DoLogicalDamage hook is alive.\n");
-        }
-
-        // Diagnostics only: every blow on a member of the army, before anything is decided.
-        LogArmyHit("DoLogicalDamage (script, every melee / missile / spell hit)", Victim, Source,
-                   static_cast<GEInt>(GetHitDamageType(Source, Victim)));
-
-        // No friendly fire inside the army of the hero: the blow is not processed at all (no damage, no reaction).
-        {
-            Entity FriendlyAttacker = GetDamageOwnerNpc(Source);
-            if (IsFriendlyFire(FriendlyAttacker, Victim, GEFalse, &Source))
-            {
-                ZeroPendingDamage(Victim); // no damage at all: the health bar of the companion does not move
-                return 0;
-            }
-            // The fallen master is never hit again by his own party (no finishing, and no damage from the inertia of an
-            // animation that was already running): the damage is equal to zero, the creature is released.
-            if (Victim != None && IsHeroSide(Victim) && IsHeroKnockedOut())
-            {
-                Entity Hitter = FriendlyAttacker;
-                if (Hitter == None && Victim.IsNPC())
-                    Hitter = Victim.NPC.GetCurrentAttacker(); // the blow came without an owner: the last attacker counts
-                if (Hitter != None && IsHeroControlled(Hitter))
-                {
-                    StandDownFromMaster(Hitter, "DoLogicalDamage");
-                    return 0;
-                }
-            }
-        }
-
-        Entity Opponent;
-        // The duel opponent is protected from the hero's elemental magic from the moment the duel is on, not only once the
-        // fight physically started (the hit itself can be the first action of the hero).
-        GEBool const bArenaVictim = FindArenaOpponent(Opponent) && Victim == Opponent && IsHeroInsideArenaZone();
-        GEBool const bWasFrozen = bArenaVictim && Victim.NPC.IsFrozen();
-        GEBool const bWasBurning = bArenaVictim && Victim.NPC.IsBurning();
-        // v1.0.48.0: the hero in a monster body: the duel judging below is skipped (the native code runs as it is).
-        GEBool const bDuelBlocked = bArenaVictim && IsHeroDuelBlocked();
-
-        GELPCChar strReason = nullptr;
-        GEBool bRangedHit = GEFalse; // v1.0.52.0: an arrow / bolt of the hero hits the opponent in the ring
-        if (bArenaVictim)
-        {
-            gEDamageType const enuType = GetHitDamageType(Source, Victim);
-            GEBool const bOwnedByOpponent = Source != None && Source.Interaction.IsValid() &&
-                                            Source.Interaction.GetOwner() == Opponent;
-            static GEInt s_iArenaDiagLines = 0;
-            if (s_iArenaDiagLines < 200)
-            {
-                ++s_iArenaDiagLines;
-                GEInt const iOwnType = Source != None && Source.Damage.IsValid()
-                                           ? static_cast<GEInt>(Source.Damage.DamageType)
-                                           : -1;
-                GEBool const bOwnedByHero = Source != None && Source.Interaction.IsValid() &&
-                                            Source.Interaction.GetOwner() == Entity::GetPlayer();
-                GetDefaultLogger().LogFormat("[GenomeLogicFix][diag] arena hit on '%s': source='%s' (own type=%d, "
-                                             "owned by hero=%d), damageType=%d, ownedByOpponent=%d, "
-                                             "burning=%d, frozen=%d, fightStarted=%d\n",
-                                             Victim.GetName().GetText(),
-                                             Source != None ? Source.GetName().GetText() : "-", iOwnType,
-                                             static_cast<int>(bOwnedByHero), static_cast<int>(enuType),
-                                             static_cast<int>(bOwnedByOpponent),
-                                             static_cast<int>(Victim.NPC.IsBurning()),
-                                             static_cast<int>(Victim.NPC.IsFrozen()),
-                                             static_cast<int>(IsArenaFightStarted()));
-            }
-            // v1.0.52.0: the elemental damage of a burning / frozen opponent that comes from an enchanted melee weapon is allowed
-            // (AllowArenaEnchantedWeapons); a cast, a shot or a bow in the hands keeps it forbidden.
-            // v1.0.52.0: the second net of the shot of a bow / crossbow: an arrow / bolt of the hero reaches the opponent.
-            if (enuType == gEDamageType_Missile && !bOwnedByOpponent && !bDuelBlocked && Source != None &&
-                Source.Interaction.IsValid() && Source.Interaction.GetOwner() == Entity::GetPlayer())
-                bRangedHit = GETrue;
-            GEBool const bEnchantedTick = (Victim.NPC.IsBurning() || Victim.NPC.IsFrozen()) && IsEnchantedMeleeEffect();
-            if (IsElementalDamage(enuType) && !bOwnedByOpponent && !bDuelBlocked && !bEnchantedTick)
-                strReason = "forbidden fire / ice / lightning damage in the arena";
-        }
-        else if (IsUnprovokedAssault(Victim, Source))
-            OnCityAssault(Victim); // two-stage reaction of the witnesses: attention first, aggro on the second blow
-
-        GEInt const iResult = DoLogicalDamage_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
-
-        // v1.0.35.0: the blow knocked a resident of a friendly city out: the crime is declared at once.
-        if (Victim != None && Victim.IsNPC() && !bArenaVictim && Source != None && IsCreatedByHero(Victim, Source))
-            OnCityKnockout(Victim, "DoLogicalDamage");
-
-        if (!strReason && bArenaVictim && !bDuelBlocked && !Victim.IsDead())
-        {
-            if (!IsEnchantedMeleeEffect()) // v1.0.52.0: the status of an enchanted melee weapon is allowed
-            {
-                if (!bWasFrozen && Victim.NPC.IsFrozen())
-                    strReason = "the arena opponent was frozen";
-                else if (!bWasBurning && Victim.NPC.IsBurning())
-                    strReason = "the arena opponent was set on fire";
-            }
-        }
-        if (bRangedHit)
-            PunishRangedShot("an arrow / a bolt hits the opponent");
-        if (strReason)
-            DeclareHeroCriminal(strReason);
-        return iResult;
+        return PluginRuntime::Combat::DoLogicalDamage(DoLogicalDamage_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
     }
 
     //
@@ -2991,7 +1175,7 @@ namespace RequirementsCheck
             if (!s_bAliveLogged)
             {
                 s_bAliveLogged = GETrue;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] %s hook is alive.\n", a_strWhere);
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] %s hook is alive.\n", a_strWhere);
             }
 
             s_bBusy = GETrue;
@@ -3039,7 +1223,7 @@ namespace RequirementsCheck
                     ++s_iArenaDiagLines;
                     bCString const strTask = Hero.Routine.GetCurrentTask();
                     bCString const strState = Hero.Routine.GetCurrentState();
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix][diag] arena: hero hurt '%s' (%s): hero task='%s' "
+                    DebugLog::GetLogger().LogFormat("[GenomeLogicFix][diag] arena: hero hurt '%s' (%s): hero task='%s' "
                                                  "state='%s', last spell='%s' (type=%d, func='%s', spell damage=%d), "
                                                  "casting=%d, previous damage type=%d, "
                                                  "burning=%d, frozen=%d -> %s\n",
@@ -3055,60 +1239,23 @@ namespace RequirementsCheck
                 if (bElemental)
                     DeclareHeroCriminal("forbidden fire / ice / lightning damage in the arena");
             }
-            else if (IsUnprovokedAssault(Victim, Hero))
-                OnCityAssault(Victim); // two-stage reaction of the witnesses: attention first, aggro on the second blow
             s_bBusy = GEFalse;
         }
 
-        // Diagnostics: the attacker stored by PSNpc::SetCurrentAttacker / SetLastAttacker on a member of the army. The
-        // damage type is the one stored on the victim (it can still hold the previous blow here, see AssessHit).
-        void LogAttackerSet(GELPCChar a_strFunction, PSNpc *a_pThis, Entity const *a_pAttacker)
-        {
-            if (!a_pThis || !a_pAttacker || !a_pThis->m_pEngineEntityPropertySet || a_pAttacker->GetInstance() == nullptr)
-                return;
-            eCEntity *pOwner = static_cast<eCEntityPropertySet *>(a_pThis->m_pEngineEntityPropertySet)->GetEntity();
-            if (!pOwner)
-                return;
-            Entity Victim(pOwner);
-            Entity Attacker(*a_pAttacker);
-            if (!Victim.IsNPC() || Victim == Attacker)
-                return;
-            GEInt const iType = Victim.DamageReceiver.IsValid() ? static_cast<GEInt>(Victim.DamageReceiver.DamageType) : 0;
-            RecordCombat(Victim, Attacker); // a real blow: the native rules of the army open
-            LogArmyHit(a_strFunction, Victim, Attacker, iType);
-        }
 
-        // ONE FOR ALL: an outsider became the current attacker of a member of the army (or of the hero in any form).
-        void OnArmyAttacked(PSNpc *a_pThis, Entity const *a_pAttacker)
-        {
-            if (!a_pThis || !a_pAttacker || !a_pThis->m_pEngineEntityPropertySet || a_pAttacker->GetInstance() == nullptr)
-                return;
-            eCEntity *pOwner = static_cast<eCEntityPropertySet *>(a_pThis->m_pEngineEntityPropertySet)->GetEntity();
-            if (!pOwner)
-                return;
-            Entity Victim(pOwner);
-            Entity Attacker(*a_pAttacker);
-            if (!Victim.IsNPC() || Victim.IsDead())
-                return;
-            DefendAllies(Victim, Attacker);
-        }
 
         mCFunctionHook Hook_NpcSetCurrentAttacker;
         void GE_STDCALL NpcSetCurrentAttacker(PSNpc *a_pThis, Entity const *a_pAttacker)
         {
-            using mFOriginal = void(GE_STDCALL *)(PSNpc *, Entity const *);
-            Hook_NpcSetCurrentAttacker.GetOriginalFunction<mFOriginal>()(a_pThis, a_pAttacker);
-            OnHeroAttackerSet(a_pThis, a_pAttacker, "PSNpc::SetCurrentAttacker");
-            LogAttackerSet("PSNpc::SetCurrentAttacker", a_pThis, a_pAttacker);
+            return PluginRuntime::Native::NpcSetCurrentAttacker(a_pThis, a_pAttacker,
+                Hook_NpcSetCurrentAttacker.GetOriginalFunction<PluginRuntime::Native::NpcSetCurrentAttackerOriginal>());
         }
 
         mCFunctionHook Hook_NpcSetLastAttacker;
         void GE_STDCALL NpcSetLastAttacker(PSNpc *a_pThis, Entity const *a_pAttacker)
         {
-            using mFOriginal = void(GE_STDCALL *)(PSNpc *, Entity const *);
-            Hook_NpcSetLastAttacker.GetOriginalFunction<mFOriginal>()(a_pThis, a_pAttacker);
-            OnHeroAttackerSet(a_pThis, a_pAttacker, "PSNpc::SetLastAttacker");
-            LogAttackerSet("PSNpc::SetLastAttacker", a_pThis, a_pAttacker);
+            return PluginRuntime::Native::NpcSetLastAttacker(a_pThis, a_pAttacker,
+                Hook_NpcSetLastAttacker.GetOriginalFunction<PluginRuntime::Native::NpcSetLastAttackerOriginal>());
         }
 
         //
@@ -3123,100 +1270,16 @@ namespace RequirementsCheck
         mCFunctionHook Hook_NpcEnableStatusEffects;
         void GE_STDCALL NpcEnableStatusEffects(PSNpc *a_pThis, GEInt a_iMask, GEBool a_bEnable)
         {
-            using mFOriginal = void(GE_STDCALL *)(PSNpc *, GEInt, GEBool);
-            GEBool const bWatched = a_pThis && a_bEnable && (a_iMask & 3) != 0 && a_pThis->m_pEngineEntityPropertySet;
-            GEBool const bWasBurning = bWatched && (a_iMask & 1) ? a_pThis->IsBurning() : GEFalse;
-            GEBool const bWasFrozen = bWatched && (a_iMask & 2) ? a_pThis->IsFrozen() : GEFalse;
-
-            Hook_NpcEnableStatusEffects.GetOriginalFunction<mFOriginal>()(a_pThis, a_iMask, a_bEnable);
-
-            static GEBool s_bBusy = GEFalse; // the witnesses' AssessTarget must not re-enter
-            if (!bWatched || s_bBusy)
-                return;
-            GEBool const bBurningStarted = (a_iMask & 1) && !bWasBurning && a_pThis->IsBurning();
-            GEBool const bFrozenStarted = (a_iMask & 2) && !bWasFrozen && a_pThis->IsFrozen();
-            if (!bBurningStarted && !bFrozenStarted)
-                return;
-
-            eCEntity *pOwner = static_cast<eCEntityPropertySet *>(a_pThis->m_pEngineEntityPropertySet)->GetEntity();
-            if (!pOwner)
-                return;
-            Entity Victim(pOwner);
-            Entity Hero = Entity::GetPlayer();
-            Entity Opponent;
-            if (Victim == Hero || !FindArenaOpponent(Opponent) || !(Victim == Opponent))
-                return;
-            if (IsHeroDuelBlocked())
-                return; // v1.0.48.0: the hero in a monster body: no duel judging, the original already ran
-            if (!IsHeroInsideArenaZone())
-            {
-                LogOutsideRing("setting the opponent on fire / freezing him");
-                return;
-            }
-            // v1.0.52.0: AllowArenaEnchantedWeapons: the status of a fire / ice SWORD (no cast, no shot) is no violation.
-            if (IsEnchantedMeleeEffect())
-            {
-                static GEInt s_iEnchantedLines = 0;
-                if (s_iEnchantedLines < 40)
-                {
-                    ++s_iEnchantedLines;
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix][diag] arena: %s started on '%s' by an enchanted melee weapon "
-                                                 "(AllowArenaEnchantedWeapons=true): allowed, the melee duel goes on.\n",
-                                                 bBurningStarted ? "BURNING" : "FREEZING", Victim.GetName().GetText());
-                }
-                return;
-            }
-
-            // Only the hero can set the opponent on fire / freeze him in the arena. If somebody else is already written
-            // down as the attacker, it is not the hero's doing.
-            Entity Attacker = Victim.NPC.GetLastAttacker();
-            Entity Current = Victim.NPC.GetCurrentAttacker();
-            GEBool const bOther = (Attacker != None && !(Attacker == Hero)) || (Current != None && !(Current == Hero));
-            static GEInt s_iStatusLines = 0;
-            if (s_iStatusLines < 100)
-            {
-                ++s_iStatusLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix][diag] arena: %s started on '%s' (last attacker '%s', "
-                                             "current attacker '%s', last spell '%s') -> %s\n",
-                                             bBurningStarted ? "BURNING" : "FREEZING", Victim.GetName().GetText(),
-                                             Attacker != None ? Attacker.GetName().GetText() : "-",
-                                             Current != None ? Current.GetName().GetText() : "-",
-                                             bCString(Hero.NPC.LastSpell).GetText(),
-                                             bOther ? "not the hero, ignored" : "the crowd reacts at once");
-            }
-            if (bOther)
-                return;
-
-            s_bBusy = GETrue;
-            DeclareHeroCriminal(bBurningStarted ? "the arena opponent was set on fire"
-                                                : "the arena opponent was frozen",
-                                GETrue);
-            s_bBusy = GEFalse;
+            return ArenaJudge::Native::NpcEnableStatusEffects(a_pThis, a_iMask, a_bEnable,
+                Hook_NpcEnableStatusEffects.GetOriginalFunction<ArenaJudge::Native::NpcEnableStatusEffectsOriginal>());
         }
 
         // PSNpc::SetLastCast(): remembers when the hero cast a spell.
         mCFunctionHook Hook_NpcSetLastCast;
         void GE_STDCALL NpcSetLastCast(PSNpc *a_pThis)
         {
-            using mFOriginal = void(GE_STDCALL *)(PSNpc *);
-            Hook_NpcSetLastCast.GetOriginalFunction<mFOriginal>()(a_pThis);
-            if (!a_pThis || !a_pThis->m_pEngineEntityPropertySet)
-                return;
-            eCEntity *pOwner = static_cast<eCEntityPropertySet *>(a_pThis->m_pEngineEntityPropertySet)->GetEntity();
-            if (pOwner && Entity(pOwner) == Entity::GetPlayer())
-            {
-                g_u32HeroCastTick = ::GetTickCount();
-                if (g_u32HeroCastTick == 0)
-                    g_u32HeroCastTick = 1;
-                ++g_u32HeroCastSeq;
-                static GEInt s_iCastLines = 0;
-                if (s_iCastLines < 30)
-                {
-                    ++s_iCastLines;
-                    bCString const strSpell = Entity::GetPlayer().NPC.LastSpell;
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix][diag] hero cast '%s'\n", strSpell.GetText());
-                }
-            }
+            return ArenaJudge::Native::NpcSetLastCast(a_pThis,
+                Hook_NpcSetLastCast.GetOriginalFunction<ArenaJudge::Native::NpcSetLastCastOriginal>());
         }
     } // namespace
 
@@ -3244,7 +1307,7 @@ namespace RequirementsCheck
                 bCString const strTask = a_Opponent.Routine.GetCurrentTask();
                 bCString const strState = a_Opponent.Routine.GetCurrentState();
                 Entity Target = a_Opponent.NPC.GetCurrentTarget();
-                GetDefaultLogger().LogFormat("[GenomeLogicFix][diag] the opponent '%s' is told to end the fight: task='%s' "
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix][diag] the opponent '%s' is told to end the fight: task='%s' "
                                              "state='%s' ai mode=%d attack reason=%d target='%s'\n",
                                              a_Opponent.GetName().GetText(), strTask.GetText(), strState.GetText(),
                                              static_cast<int>(a_Opponent.Routine.AIMode),
@@ -3273,7 +1336,7 @@ namespace RequirementsCheck
             g_bDuelLossDone = GETrue;
 
             Entity Attacker = Hero.NPC.GetCurrentAttacker();
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] The hero is knocked out after a violation in the arena (opponent "
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix] The hero is knocked out after a violation in the arena (opponent "
                                          "'%s', knocked out by '%s'): the duel is over.\n",
                                          Opponent.GetName().GetText(),
                                          Attacker != None ? Attacker.GetName().GetText() : "-");
@@ -3290,132 +1353,9 @@ namespace RequirementsCheck
         }
     } // namespace
 
-    ME_DEFINE_AND_HOOK_SCRIPT(Defeat)
+        ME_DEFINE_AND_HOOK_SCRIPT(Defeat)
     {
-        Entity Self = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-        Entity Hero = Entity::GetPlayer();
-        if (Self == Hero && g_bSpareArena)
-        {
-            // v1.0.60.0: the hero falls after a violation of the arena (the crowd punishes him): the opponent will speak over him.
-            Entity ViolationOpponent;
-            if (FindArenaOpponent(ViolationOpponent) || FindRememberedOpponent(ViolationOpponent) ||
-                FindDuelOpponentAnywhere(ViolationOpponent))
-                ScheduleOverLine(ViolationOpponent);
-        }
-        // v1.0.61.0: stage 2: the hero is knocked out - the opponent held in the fight stops it and leaves (the voice over the hero).
-        if (Self == Hero)
-            ReleaseStage2Hold("Defeat of the hero");
-        if (Self == Hero)
-        {
-            g_bSpareActive = GEFalse; // a new knock-out: the fall point is taken anew
-            BeginHeroImmunity();      // v1.0.57.0: from now until he stands on his feet nobody may kill the hero
-            RememberHeroFall(GEFalse); // mercy: the place where the hero fell (the arena loss is handled right below)
-        }
-
-        // The OPPONENT of the duel is knocked out by somebody who is not the hero (a witness, a companion, a summon): the
-        // quest must not become a victory - the fight is lost. The one who dealt the blow is the current attacker of the
-        // knocked-out NPC (the last attacker when it is empty); nobody written down (a burning tick of the hero's fire) is
-        // not a third party.
-        GEBool bThirdParty = GEFalse;
-        if (!(Self == Hero) && Self.IsNPC() && HasRunningArenaQuest())
-        {
-            Entity OppSeen;
-            GEBool bIsOpponent = FindArenaOpponent(OppSeen) && OppSeen == Self;
-            if (!bIsOpponent && !g_strArenaOpponent.IsEmpty() && Self.GetName() == g_strArenaOpponent)
-                bIsOpponent = GETrue;
-            if (bIsOpponent)
-            {
-                Entity Who = Self.NPC.GetCurrentAttacker();
-                if (Who == None)
-                    Who = Self.NPC.GetLastAttacker();
-                if (Who != None && !(Who == Hero) && Who.IsNPC())
-                {
-                    bThirdParty = GETrue;
-                    g_bLostToThirdParty = GETrue; // the status hook turns Success / Won into Lost
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix] The arena opponent '%s' is knocked out by '%s', not by "
-                                                 "the hero: the duel is lost.\n",
-                                                 Self.GetName().GetText(), Who.GetName().GetText());
-                }
-            }
-        }
-
-        Entity Opponent;
-        GEBool bForcedLoss = GEFalse;
-        // The arena fight is on: the opponent is found by his attack reason, or - when the reason already changed
-        // (witnesses attack the hero too) - by the remembered name while the duel quest still runs.
-        GEBool bArenaOn = GEFalse;
-        if (Self == Hero)
-        {
-            GEBool const bQuest = HasRunningArenaQuest();
-            bArenaOn = (IsArenaFightStarted() && FindArenaOpponent(Opponent)) ||
-                       (bQuest && (FindArenaOpponent(Opponent) || FindRememberedOpponent(Opponent)));
-            static GEInt s_iDefeatLines = 0;
-            if (s_iDefeatLines < 60)
-            {
-                ++s_iDefeatLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix][diag] Defeat of the hero: duel quest running=%d, "
-                                             "arena fight=%d, opponent '%s' -> %s\n",
-                                             static_cast<int>(bQuest), static_cast<int>(IsArenaFightStarted()),
-                                             Opponent != None ? Opponent.GetName().GetText() : "-",
-                                             bArenaOn ? "arena knock-out" : "not an arena fight");
-            }
-        }
-        if (bArenaOn)
-        {
-            Entity Attacker = Hero.NPC.GetCurrentAttacker();
-            GEBool const bByOpponent = Attacker == Opponent;
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] The hero is knocked out in the arena fight (opponent '%s', "
-                                         "knocked out by '%s').\n",
-                                         Opponent.GetName().GetText(),
-                                         Attacker != None ? Attacker.GetName().GetText() : "-");
-            if (!bByOpponent)
-            {
-                bForcedLoss = GETrue;
-                LogArenaQuests("before knock-out");
-                Hero.NPC.SetCurrentAttacker(Opponent);
-            }
-        }
-
-        GEInt const iResult = Defeat_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
-
-        // v1.0.35.0: a resident of a friendly city is knocked out by the hero: the full crime at once, no timer.
-        if (Self != None && !(Self == Hero) && Self.IsNPC())
-            OnCityKnockout(Self, "Defeat");
-
-        if (bThirdParty)
-        {
-            // The native Defeat of the opponent has reported the "victory" to the quest manager; if the quest still runs
-            // (the status hook did not have to act), the loss is reported the way a consumable does it.
-            if (HasRunningArenaQuest())
-            {
-                Hero.NPC.SetCurrentAttacker(Self);
-                Entity World = Entity::GetWorldEntity();
-                World.QuestManager.OnNPCDefeated(Hero);
-            }
-            LogArenaQuests("opponent knocked out by a third party");
-            AnnounceLossToThirdParty();
-        }
-
-        if (bForcedLoss)
-        {
-            if (HasRunningArenaQuest())
-            {
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] The duel quest is still running after Defeat: "
-                                             "OnNPCDefeated is called by hand.\n");
-                Hero.NPC.SetCurrentAttacker(Opponent);
-                Entity World = Entity::GetWorldEntity();
-                World.QuestManager.OnNPCDefeated(Hero);
-            }
-            LogArenaQuests("after knock-out");
-            EndArenaFightOfOpponent(Opponent);
-            g_bDuelLossDone = GETrue; // done, the common end of the duel below must not repeat it
-            // v1.0.59.0: the artificial line "Бой проигран!" is removed: the loss is silent.
-        }
-        // After a violation of the arena rules the duel ends for everybody WHOEVER knocked the hero out - also when the
-        // opponent himself did it (the native code then did not stop him, he attacked the hero again after he got up).
-        if (Self == Hero && g_bSpareArena && !bForcedLoss)
-            EndArenaDuelAfterKnockout();
-        return iResult;
+        return PluginRuntime::Combat::Defeat(Defeat_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
     }
 
     //
@@ -3435,22 +1375,19 @@ namespace RequirementsCheck
     // GoBack). The hook gives the watchers their routine back when the 10 s window ran out without a second blow
     // (ContinueRoutine, the call the native ZS_WatchFight itself uses to leave), and keeps them turned to the hero.
     //
-    ME_DEFINE_AND_REPLACE_SCRIPT_AI_STATE(ZS_WatchFight_Loop)
+    ME_DEFINE_AND_REGISTER_SCRIPT_AI_STATE(GLF_PersonalBrawlExit)
     {
-        Entity Self(a_pSPU->GetSelfEntity());
-        CheckArenaCompanions(); // the spectators of the arena run this loop: the ring is closed to companions / summons
-        TrackDuelForCompanions();
-        if (Self != None && ReleaseWatcherIfOver(Self))
-            return GETrue;
+        return GroupLogic::Brawl::RunPersonalBrawlExit(a_rRunTimeStack, a_pSPU);
+    }
 
-        GEBool const bResult = ZS_WatchFight_Loop_Original(a_rRunTimeStack, a_pSPU);
+    ME_DEFINE_AND_REGISTER_SCRIPT_AI_STATE(GLF_PersonalBrawlSpectator)
+    {
+        return GroupLogic::Brawl::RunPersonalBrawlSpectator(a_rRunTimeStack, a_pSPU);
+    }
 
-        if (Self != None && g_enuCityPhase == mECityPhase_Watching && IsWatcher(Self))
-        {
-            Entity Hero = Entity::GetPlayer();
-            Self.SetAlignmentTarget(Hero);
-        }
-        return bResult;
+        ME_DEFINE_AND_REPLACE_SCRIPT_AI_STATE(ZS_WatchFight_Loop)
+    {
+        return PluginRuntime::Loops::ZS_WatchFight_Loop(ZS_WatchFight_Loop_Original, a_rRunTimeStack, a_pSPU);
     }
 
     //
@@ -3461,18 +1398,9 @@ namespace RequirementsCheck
     //
     // ZS_Arena_Loop is the state of the NPC who waits in / walks to the ring before the fight starts: the hero can enter
     // with his companions at that moment, when nobody runs the attack loop yet.
-    ME_DEFINE_AND_REPLACE_SCRIPT_AI_STATE(ZS_Arena_Loop)
+        ME_DEFINE_AND_REPLACE_SCRIPT_AI_STATE(ZS_Arena_Loop)
     {
-        CheckArenaCompanions();
-        TrackDuelForCompanions();
-        {
-            Entity Gladiator(a_pSPU->GetSelfEntity());
-            // v1.0.47.0: BEFORE the native loop sends him to the hero: the hero is in the ring with the magic in his hand ->
-            // the stance of the warning at once, the order to come closer is never carried out.
-            if (Gladiator != None && (PreemptMagicWarning(Gladiator) || HoldOpponentInWarning(Gladiator)))
-                return GETrue; // the magic in the hand of the hero: the stance, not the arena routine
-        }
-        return ZS_Arena_Loop_Original(a_rRunTimeStack, a_pSPU);
+        return PluginRuntime::Loops::ZS_Arena_Loop(ZS_Arena_Loop_Original, a_rRunTimeStack, a_pSPU);
     }
 
     //
@@ -3489,168 +1417,13 @@ namespace RequirementsCheck
     //
     namespace
     {
-        // True: the NPC was handled (the attack was dropped), the native loop must not run in this tick.
-        GEBool FixStaleHeroTarget(Entity &a_Npc)
-        {
-            if (a_Npc == None || !a_Npc.IsNPC())
-                return GEFalse;
-            Entity Target = a_Npc.NPC.GetCurrentTarget();
-            Entity Player = Entity::GetPlayer();
-            GEBool bStale = GEFalse;
-            if (Target != None)
-            {
-                // The removed body of the hero: it is not the player any more (the beast is).
-                bCString const strTarget = Target.GetName();
-                bStale = !(Target == Player) && strTarget.GetText() != nullptr && _stricmp(strTarget.GetText(), "PC_Hero") == 0;
-            }
-            else
-            {
-                // No target at all, but the plugin sent him against the hero (the crime): the target is lost. v1.0.67.0: only while the
-                // hero is in a form (or the form is awaited): after a knock-out or a normal end of a fight an empty target is the native
-                // end of the attack and is not repaired.
-                if (IsHeroKnockedOut() || !(g_bFormAggroPending || IsHeroTransformedNow()))
-                    return GEFalse;
-                bStale = FindAggro(a_Npc.GetName()) >= 0 && a_Npc.NPC.AttackReason != gEAttackReason_None;
-            }
-            if (!bStale)
-                return GEFalse;
 
-            static GEInt s_iLines = 0;
-            if (Player != None && !Player.IsDead())
-            {
-                a_Npc.NPC.SetCurrentTarget(Player);
-                if (s_iLines < 30)
-                {
-                    ++s_iLines;
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix] ZS_Attack_Loop: '%s' had the removed body of the hero as the target - "
-                                                 "he is aimed at the current body of the hero '%s'.\n",
-                                                 a_Npc.GetName().GetText(), Player.GetName().GetText());
-                }
-                return GEFalse;
-            }
-            a_Npc.Routine.FullStop();
-            a_Npc.NPC.SetCurrentTarget(None);
-            a_Npc.NPC.AttackReason = gEAttackReason_None;
-            a_Npc.Routine.ContinueRoutine();
-            if (s_iLines < 30)
-            {
-                ++s_iLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] ZS_Attack_Loop: '%s' has no body of the hero to attack - the attack is "
-                                             "dropped.\n",
-                                             a_Npc.GetName().GetText());
-            }
-            return GETrue;
-        }
 
-        // No C++ object with a destructor in this function (a structured exception handler needs it that way). The guard counter tells
-        // the crash reporter (CrashDiag) that an access violation inside the call is handled here and is not the end of the game.
-        GEBool CallAttackLoopGuarded(gFScriptAIState a_pfnOriginal, bTObjStack<gScriptRunTimeSingleState> &a_rRunTimeStack,
-                                     gCScriptProcessingUnit *a_pSPU, GEBool *o_pFaulted)
-        {
-            GEBool bResult = GETrue;
-            CrashDiag::GuardEnter();
-            __try
-            {
-                __try
-                {
-                    bResult = a_pfnOriginal(a_rRunTimeStack, a_pSPU);
-                }
-                __finally
-                {
-                    CrashDiag::GuardLeave();
-                }
-            }
-            __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH)
-            {
-                *o_pFaulted = GETrue;
-                bResult = GETrue;
-            }
-            return bResult;
-        }
     } // namespace
 
-    ME_DEFINE_AND_REPLACE_SCRIPT_AI_STATE(ZS_Attack_Loop)
+        ME_DEFINE_AND_REPLACE_SCRIPT_AI_STATE(ZS_Attack_Loop)
     {
-        // v1.0.66.0: the stale target (the removed body of the hero after a transformation) is repaired before anything reads it.
-        {
-            Entity Fighter(a_pSPU->GetSelfEntity());
-            if (FixStaleHeroTarget(Fighter))
-                return GETrue;
-        }
-        // The master is knocked out: a creature of his party that was fighting him stops at once (no finishing blow).
-        {
-            Entity Fighter(a_pSPU->GetSelfEntity());
-            if (StandDownFromMaster(Fighter, "ZS_Attack_Loop"))
-                return GETrue;
-            // v1.0.41.0: the opponent in the warning stance (the magic in the hand of the hero) is put back into the stance.
-            // v1.0.47.0: and he is put there BEFORE the first blow when the magic is already in the hand.
-            if (Fighter != None && (PreemptMagicWarning(Fighter) || HoldOpponentInWarning(Fighter)))
-                return GETrue;
-        }
-        // The event "the hero stands again" is noticed here too: after the hero got up nobody asks about killing him.
-        SpareHousekeeping();
-        CheckArenaCompanions(); // the ring is closed to companions / summons while the duel quest runs
-        TrackDuelForCompanions(); // the companions wait while the duel quest runs and come back after it
-        {
-            Entity Gladiator(a_pSPU->GetSelfEntity());
-            Entity GTarget = Gladiator != None ? Gladiator.NPC.GetCurrentTarget() : Entity();
-            if (Gladiator != None && GTarget != None && IsHeroControlled(GTarget) && IsDuelTaboo(Gladiator))
-            {
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] The duel opponent '%s' leaves '%s' (party of the hero) alone.\n",
-                                             Gladiator.GetName().GetText(), GTarget.GetName().GetText());
-                Gladiator.Routine.FullStop();
-                Gladiator.NPC.SetCurrentTarget(None);
-                Gladiator.NPC.SetCurrentAttacker(None);
-                Gladiator.NPC.AttackReason = gEAttackReason_None;
-                Gladiator.Routine.ContinueRoutine();
-                return GETrue;
-            }
-        }
-        if (g_bAggroRelease)
-        {
-            Entity Self(a_pSPU->GetSelfEntity());
-            Entity Hero = Entity::GetPlayer();
-            GEInt const iIndex = Self != None ? FindAggro(Self.GetName()) : -1;
-            if (iIndex >= 0 && Self.NPC.GetCurrentTarget() == Hero && !IsHeroKnockedOut())
-            {
-                g_arrAggroNames[iIndex] = g_arrAggroNames[g_iAggroCount - 1];
-                g_arrAggroNames[g_iAggroCount - 1] = bCString();
-                --g_iAggroCount;
-                if (g_iAggroCount == 0)
-                    g_bAggroRelease = GEFalse;
-                Self.Routine.FullStop();
-                Self.NPC.SetCurrentTarget(None);
-                Self.NPC.AttackReason = gEAttackReason_None;
-                Self.Routine.ContinueRoutine();
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] '%s' calms down: the hero is on his feet again (%d left).\n",
-                                             Self.GetName().GetText(), static_cast<int>(g_iAggroCount));
-                return GETrue;
-            }
-        }
-        GEBool bFaulted = GEFalse;
-        GEBool const bResult = CallAttackLoopGuarded(ZS_Attack_Loop_Original, a_rRunTimeStack, a_pSPU, &bFaulted);
-        if (bFaulted)
-        {
-            // v1.0.66.0: the native loop faulted (a target that is not there any more): the attack is dropped, the game goes on.
-            Entity Faulty(a_pSPU->GetSelfEntity());
-            static GEInt s_iFaultLines = 0;
-            if (s_iFaultLines < 30)
-            {
-                ++s_iFaultLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] ZS_Attack_Loop: the native loop of '%s' faulted (access violation) - the "
-                                             "attack is dropped, the NPC goes back to his routine.\n",
-                                             Faulty != None ? Faulty.GetName().GetText() : "?");
-            }
-            if (Faulty != None && Faulty.IsNPC())
-            {
-                Faulty.Routine.FullStop();
-                Faulty.NPC.SetCurrentTarget(None);
-                Faulty.NPC.SetCurrentAttacker(None);
-                Faulty.NPC.AttackReason = gEAttackReason_None;
-                Faulty.Routine.ContinueRoutine();
-            }
-        }
-        return bResult;
+        return PluginRuntime::Loops::ZS_Attack_Loop(ZS_Attack_Loop_Original, a_rRunTimeStack, a_pSPU);
     }
 
     //
@@ -3713,11 +1486,6 @@ namespace RequirementsCheck
             mEWaiterType_User = 1,
             mEWaiterType_Auto = 2,
         };
-        GEInt const WTYPE_MAX = 48;
-        bCString g_arrUserWait[WTYPE_MAX];
-        GEInt g_iUserWait = 0;
-        bCString g_arrAutoWait[WTYPE_MAX];
-        GEInt g_iAutoWait = 0;
         // The plugin's own arena session (NOT the status of the quest in the journal: the game sets that to Running by itself after a
         // loss, and it must stay as it is, or the duel could not be taken again). True from the start of the duel until a cancellation,
         // the end of the duel, a teleport or the departure of the hero from the arena.
@@ -3755,6 +1523,168 @@ namespace RequirementsCheck
             --a_iCount;
         }
 
+        GEBool g_bArenaEntryLoaded = GEFalse;
+        GEBool g_bArenaEntryPending = GEFalse;
+        bCVector g_vArenaEntryOrigin;
+        GEFloat const ARENA_ENTRY_LEAVE_DISTANCE = 10000.0f;
+        void CancelAbandonedArena(GELPCChar why, GEBool keepWaiting);
+        Entity ArenaEntryMemory()
+        {
+            Entity body = Entity::GetEntity(bCString("PC_Hero"));
+            if (body != None && body.PlayerMemory.IsValid()) return body;
+            return Entity::GetPlayer();
+        }
+        void StoreEntryPending(GEBool enabled)
+        {
+            g_bArenaEntryPending = enabled;
+            Entity memory = ArenaEntryMemory();
+            if (memory == None || !memory.PlayerMemory.IsValid()) return;
+            bCString const key("GLF_ArenaEntryPending");
+            if (enabled) memory.PlayerMemory.SetGameEvent(key);
+            else memory.PlayerMemory.ClearGameEvent(key);
+        }
+
+        GEBool g_bArenaEntryCenterKnown = GEFalse;
+        GEU32 g_u32ArenaCenterRetry = 0;
+        void ConsiderArenaZone(Entity &candidate, Entity &zone, GEBool &ambiguous)
+        {
+            if (candidate == None || !candidate.Arena.IsValid()) return;
+            if (zone == None) zone = candidate;
+            else if (zone != candidate) ambiguous = GETrue;
+        }
+        void ConsiderArenaAnchor(Entity &anchor, Entity &zone, GEBool &ambiguous)
+        {
+            if (anchor == None || IsHeroSide(anchor)) return;
+            ConsiderArenaZone(anchor, zone, ambiguous);
+            Entity containing = anchor.GetZone();
+            ConsiderArenaZone(containing, zone, ambiguous);
+        }
+        void ConsiderArenaQuestEntity(bCString const &name, Entity &zone, GEBool &ambiguous)
+        {
+            if (name.IsEmpty()) return;
+            Entity entity = Entity::GetEntity(name);
+            ConsiderArenaAnchor(entity, zone, ambiguous);
+            if (entity == None || !entity.IsNPC() || !entity.Navigation.IsValid()) return;
+            Entity destination = entity.Navigation.GetAIGotoDestination();
+            ConsiderArenaAnchor(destination, zone, ambiguous);
+            destination = entity.Navigation.GetCurrentDestinationPoint();
+            ConsiderArenaAnchor(destination, zone, ambiguous);
+        }
+        GEBool ResolveArenaEntryCenter(bCVector &center)
+        {
+            gCQuestManager_PS *manager = gCQuestManager_PS::GetInstance();
+            if (!manager) return GEFalse;
+            gCQuest_PS *quest = nullptr;
+            GEInt count = 0;
+            bTObjArray<bTAutoPOSmartPtr<gCQuest_PS>> const &quests = manager->GetQuests();
+            for (GEInt i = 0; i < quests.GetCount(); ++i)
+            {
+                gCQuest_PS *entry = const_cast<gCQuest_PS *>(static_cast<gCQuest_PS const *>(quests.GetAt(i)));
+                if (entry && entry->GetType() == gEQuestType_Arena && entry->GetStatus() == gEQuestStatus_Running)
+                { quest = entry; ++count; }
+            }
+            Entity zone;
+            GEBool ambiguous = count != 1;
+            GELPCChar method = "quest entity/target zone";
+            if (!ambiguous)
+            {
+                ConsiderArenaQuestEntity(quest->GetDestinationEntity(), zone, ambiguous);
+                bTObjArray<bCString> const &entities = quest->GetDeliveryEntities();
+                for (GEInt i = 0; i < entities.GetCount(); ++i)
+                    ConsiderArenaQuestEntity(entities.GetAt(i), zone, ambiguous);
+                // A unique native Running zone is evidence only with one Running arena quest.
+                if (zone == None && !ambiguous)
+                {
+                    method = "unique native running arena";
+                    bTObjArray<Entity> all = Entity::GetEntities();
+                    for (GEInt i = 0; i < all.GetCount(); ++i)
+                    {
+                        Entity candidate = all.GetAt(i);
+                        if (candidate != None && candidate.Arena.IsValid() && candidate.Arena.Status == gEArenaStatus_Running)
+                            ConsiderArenaZone(candidate, zone, ambiguous);
+                    }
+                }
+            }
+            if (ambiguous || zone == None)
+            {
+                static GEInt failures = 0;
+                if (failures++ < 20)
+                    DebugLog::GetLogger().LogFormat("[GenomeLogicFix][arena-entry] center unresolved: runningQuests=%d ambiguous=%d zone='%s'; no guessed cancellation.\n",
+                        count, static_cast<int>(ambiguous), zone != None ? zone.GetName().GetText() : "-");
+                return GEFalse;
+            }
+            bCBox const &bounds = zone.GetInstance()->GetWorldNodeBoundary();
+            if (!bounds.IsValid() || bounds.GetMax().m_fX <= bounds.GetMin().m_fX ||
+                bounds.GetMax().m_fZ <= bounds.GetMin().m_fZ)
+            {
+                static GEInt badBounds = 0;
+                if (badBounds++ < 20) DebugLog::GetLogger().LogFormat("[GenomeLogicFix][arena-entry] center unresolved: zone='%s' has invalid/empty world bounds.\n", zone.GetName().GetText());
+                return GEFalse;
+            }
+            bCVector const candidate = bounds.GetCenter();
+            if (!std::isfinite(candidate.m_fX) || !std::isfinite(candidate.m_fZ))
+            {
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix][arena-entry] center unresolved: non-finite world center.\n");
+                return GEFalse;
+            }
+            center = candidate;
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix][arena-entry] quest='%s' zone='%s' world-boundary center=(%.0f,%.0f,%.0f), via %s.\n",
+                quest->GetName().GetText(), zone.GetName().GetText(), center.m_fX, center.m_fY, center.m_fZ, method);
+            return GETrue;
+        }
+        void BeginArenaEntry(Entity &hero)
+        {
+            (void)hero;
+            g_bArenaEntryLoaded = GETrue;
+            g_bArenaEntryCenterKnown = GEFalse;
+            g_u32ArenaCenterRetry = 0;
+            Entity memory = ArenaEntryMemory();
+            if (memory != None && memory.PlayerMemory.IsValid())
+                memory.PlayerMemory.SetGameEvent(bCString("GLF_ArenaEntryKnown"));
+            StoreEntryPending(!IsHeroInsideArenaZone());
+        }
+        GEBool PollArenaEntry()
+        {
+            if (!g_bArenaEntryLoaded)
+            {
+                Entity memory = ArenaEntryMemory();
+                if (memory == None || !memory.PlayerMemory.IsValid()) return GEFalse;
+                g_bArenaEntryLoaded = GETrue;
+                GEBool const known = memory.PlayerMemory.IsSetGameEvent(bCString("GLF_ArenaEntryKnown"));
+                g_bArenaEntryPending = known
+                    ? memory.PlayerMemory.IsSetGameEvent(bCString("GLF_ArenaEntryPending"))
+                    : HasRunningArenaQuest() && !IsHeroInsideArenaZone();
+                if (!known)
+                {
+                    memory.PlayerMemory.SetGameEvent(bCString("GLF_ArenaEntryKnown"));
+                    StoreEntryPending(g_bArenaEntryPending);
+                    DebugLog::GetLogger().LogFormat("[GenomeLogicFix][arena-entry] legacy save adopted: first-entry history unknown, pending=%d; center will be resolved from arena.\n", static_cast<int>(g_bArenaEntryPending));
+                }
+            }
+            if (!g_bArenaEntryPending) return GEFalse;
+            if (!HasRunningArenaQuest() || IsHeroInsideArenaZone() || g_bRingSeen)
+            {
+                StoreEntryPending(GEFalse);
+                return GEFalse;
+            }
+            Entity hero = Entity::GetPlayer();
+            if (hero == None) return GETrue;
+            if (!g_bArenaEntryCenterKnown)
+            {
+                GEU32 const now = ::GetTickCount();
+                if (g_u32ArenaCenterRetry != 0 && static_cast<GEInt>(now - g_u32ArenaCenterRetry) < 1000) return GETrue;
+                g_u32ArenaCenterRetry = now | 1;
+                g_bArenaEntryCenterKnown = ResolveArenaEntryCenter(g_vArenaEntryOrigin);
+                if (!g_bArenaEntryCenterKnown) return GETrue;
+            }
+            bCVector const position = hero.GetPosition();
+            GEFloat const dx = position.m_fX - g_vArenaEntryOrigin.m_fX;
+            GEFloat const dz = position.m_fZ - g_vArenaEntryOrigin.m_fZ;
+            if (dx*dx + dz*dz > ARENA_ENTRY_LEAVE_DISTANCE*ARENA_ENTRY_LEAVE_DISTANCE)
+                CancelAbandonedArena("more than 10000 horizontally from arena center before entry", GETrue);
+            return GETrue;
+        }
+
         GEFloat DistanceFromSessionStart(bCVector const &a_vPosition)
         {
             GEFloat const fDx = a_vPosition.m_fX - g_vArenaSessionStart.m_fX;
@@ -3764,27 +1694,13 @@ namespace RequirementsCheck
         }
 
         mEWaiterType GetWaiterType(Entity &a_Npc)
-        {
-            bCString const strName = a_Npc.GetName();
-            if (FindNameIn(g_arrUserWait, g_iUserWait, strName) >= 0)
-                return mEWaiterType_User;
-            if (FindWaiter(strName) >= 0 || FindNameIn(g_arrAutoWait, g_iAutoWait, strName) >= 0)
-                return mEWaiterType_Auto;
-            return mEWaiterType_None;
-        }
+        { return static_cast<mEWaiterType>(GroupLogic::Waiting::GetWaiterType(a_Npc)); }
 
         GELPCChar WaiterTypeText(mEWaiterType a_enuType)
-        {
-            return a_enuType == mEWaiterType_User ? "USER" : (a_enuType == mEWaiterType_Auto ? "AUTO" : "none");
-        }
+        { return GroupLogic::Waiting::WaiterTypeText(static_cast<GroupLogic::WaiterType>(a_enuType)); }
 
         void ClearWaiterMarks(Entity &a_Npc)
-        {
-            bCString const strName = a_Npc.GetName();
-            RemoveNameFrom(g_arrUserWait, g_iUserWait, strName);
-            RemoveNameFrom(g_arrAutoWait, g_iAutoWait, strName);
-            RemoveNameFrom(g_arrWaiters, g_iWaiterCount, strName);
-        }
+        { GroupLogic::Waiting::ClearWaiterMarks(a_Npc); }
 
         GEBool IsSessionAutoWaiter(Entity &a_Npc)
         {
@@ -3799,18 +1715,11 @@ namespace RequirementsCheck
 
         // The player ordered "wait here": the wait is his, the plugin never breaks it.
         void MarkWaiterUser(Entity &a_Npc)
-        {
-            ClearWaiterMarks(a_Npc);
-            AddNameTo(g_arrUserWait, g_iUserWait, WTYPE_MAX, a_Npc.GetName());
-        }
+        { GroupLogic::Waiting::MarkWaiterUser(a_Npc); }
 
         // The plugin / the game ordered the wait: the next teleport carries him.
         void MarkWaiterAuto(Entity &a_Npc)
-        {
-            bCString const strName = a_Npc.GetName();
-            RemoveNameFrom(g_arrUserWait, g_iUserWait, strName);
-            AddNameTo(g_arrAutoWait, g_iAutoWait, WTYPE_MAX, strName);
-        }
+        { GroupLogic::Waiting::MarkWaiterAuto(a_Npc); }
 
         void ResetWaiterMarks();
         void MarkWaiterAutoPublic(Entity &a_Npc) { MarkWaiterAuto(a_Npc); }
@@ -3819,17 +1728,11 @@ namespace RequirementsCheck
 
         void ResetWaiterMarks()
         {
-            for (GEInt i = 0; i < WTYPE_MAX; ++i)
-            {
-                g_arrUserWait[i] = bCString();
-                g_arrAutoWait[i] = bCString();
-            }
-            g_iUserWait = 0;
-            g_iAutoWait = 0;
+            GroupLogic::Waiting::ResetWaiterMarks();
             g_bArenaSessionHold = GEFalse;
             g_bArenaSessionCancelled = GEFalse;
             g_bArenaReleasePending = GEFalse;
-        }
+                }
 
         // Called ONCE at the start of the duel quest (v1.0.27.0): a creature that is put to wait is remembered by name.
         // (not loaded yet after a save game, left behind after a teleport) and comes to the hero later is put to wait at
@@ -3849,19 +1752,19 @@ namespace RequirementsCheck
                     continue;
                 if (Npc.Party.Waiting)
                     continue; // one the player already told to wait is left alone and is NOT given back later
-                RemoveNameFrom(g_arrUserWait, g_iUserWait, strName); // v1.0.68.0: a stale USER mark of an earlier wait
-                RemoveNameFrom(g_arrAutoWait, g_iAutoWait, strName);
+                GroupLogic::Waiting::RemoveUserMark(strName); // v1.0.68.0: a stale USER mark of an earlier wait
+                GroupLogic::Waiting::RemoveAutoMark(strName);
                 g_arrWaiters[g_iWaiterCount++] = strName;           // v1.0.68.0: WaiterType = AUTO, the waiter of THIS arena session
                 Npc.Party.Waiting = GETrue;
                 Npc.Routine.FullStop();
                 Npc.Routine.SetTask("ZS_WaitForPlayer");
                 PrintCompanionWaitMessage(Npc);
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] '%s' (party type %d) waits: the duel quest runs.\n",
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] '%s' (party type %d) waits: the duel quest runs.\n",
                                              strName.GetText(), static_cast<int>(Npc.Party.PartyMemberType));
                 ++iNew;
             }
             if (a_bDuelStart || iNew > 0)
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] The duel quest runs: %d companion(s) of the hero wait now "
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] The duel quest runs: %d companion(s) of the hero wait now "
                                              "(%d in all).\n",
                                              static_cast<int>(iNew), static_cast<int>(g_iWaiterCount));
         }
@@ -3889,7 +1792,7 @@ namespace RequirementsCheck
         {
             if (a_bFromLost && IsArenaSessionGate() && !IsDialogueRunning())
             {
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Arena: the quest is Running again (Lost -> Running) after a lost / cancelled duel "
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Arena: the quest is Running again (Lost -> Running) after a lost / cancelled duel "
                                              "and no dialogue runs - the game restored it by itself, this is NOT a new duel (no session, "
                                              "the companions are not put to wait, the journal is not touched).\n");
                 CrashDiag::Note("arena: Lost -> Running restored by the game, no dialogue: NOT a new duel, no session");
@@ -3903,7 +1806,11 @@ namespace RequirementsCheck
             {
                 Entity SessionHero = Entity::GetPlayer();
                 if (SessionHero != None)
+                {
                     g_vArenaSessionStart = SessionHero.GetPosition();
+                    g_bRingSeen = GEFalse;
+                    BeginArenaEntry(SessionHero);
+                }
             }
             g_bArenaSessionCancelled = GEFalse;
             g_bArenaReleasePending = GEFalse;
@@ -3946,7 +1853,7 @@ namespace RequirementsCheck
                     ++iBack;
                 }
             }
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] The duel is over (%s): %d companion(s) follow the hero "
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix] The duel is over (%s): %d companion(s) follow the hero "
                                          "again, %d far one(s) stay where they are.\n",
                                          a_strWhy, static_cast<int>(iBack), static_cast<int>(iFar));
             for (GEInt i = 0; i < WAITER_MAX; ++i)
@@ -3963,7 +1870,7 @@ namespace RequirementsCheck
             if (a_bCancelled)
                 g_bArenaSessionCancelled = GETrue;
             if (bHad)
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Arena session ended (%s): %d AUTO waiter(s) of the session, release mode %d.\n",
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Arena session ended (%s): %d AUTO waiter(s) of the session, release mode %d.\n",
                                              a_strWhy, static_cast<int>(g_iWaiterCount), static_cast<int>(a_iRelease));
             if (a_iRelease >= 2)
                 ReleaseWaitingCompanions(a_strWhy);
@@ -4002,7 +1909,7 @@ namespace RequirementsCheck
             bCString const strName = a_Npc.GetName();
             if (FindWaiter(strName) >= 0)
                 return GEFalse; // already an AUTO waiter of the session
-            if (FindNameIn(g_arrUserWait, g_iUserWait, strName) >= 0)
+            if (GroupLogic::Waiting::HasUserMark(strName))
                 return GEFalse; // the player has said "wait here" since the load: his order stays
             // Only a companion that waits NEAR the hero (on the tribune of the arena) belongs to the arena session. A companion that waits
             // far away (another city: the order of the player, or a stone) keeps his wait - the running arena quest has nothing to do with him.
@@ -4010,14 +1917,14 @@ namespace RequirementsCheck
                 return GEFalse;
             if (g_iWaiterCount >= WAITER_MAX)
                 return GEFalse;
-            RemoveNameFrom(g_arrAutoWait, g_iAutoWait, strName);
+            GroupLogic::Waiting::RemoveAutoMark(strName);
             g_arrWaiters[g_iWaiterCount++] = strName; // WaiterType = AUTO, the waiter of the arena session
             char strLine[300] = {};
             _snprintf_s(strLine, sizeof(strLine), _TRUNCATE,
                         "[GenomeLogicFix][teleport] save game | '%s' | party type %d | Waiting=1 | distance %.0f | WaiterType=AUTO | ADOPTED: "
                         "the arena quest is natively Running in the loaded save, so his wait is the arena session's, not the player's",
                         strName.GetText(), static_cast<int>(enuType), static_cast<double>(a_Npc.GetDistanceTo(a_Hero)));
-            GetDefaultLogger().LogFormat("%s\n", strLine);
+            DebugLog::GetLogger().LogFormat("%s\n", strLine);
             CrashDiag::Note(strLine);
             return GETrue;
         }
@@ -4034,7 +1941,7 @@ namespace RequirementsCheck
                 if (bGiveUp)
                 {
                     g_bArenaAdoptPending = GEFalse;
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix] Save game: no arena quest is Running - the waiting companions keep the "
+                    DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Save game: no arena quest is Running - the waiting companions keep the "
                                                  "wait of the player.\n");
                 }
                 return;
@@ -4070,7 +1977,7 @@ namespace RequirementsCheck
                 g_bDuelWasActive = GETrue;
                 g_vArenaSessionStart = Hero.GetPosition();
             }
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Save game: the arena quest is Running, %d waiting companion(s) adopted as AUTO waiters "
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Save game: the arena quest is Running, %d waiting companion(s) adopted as AUTO waiters "
                                          "of the arena session.\n",
                                          static_cast<int>(iAdopted));
         }
@@ -4107,7 +2014,8 @@ namespace RequirementsCheck
             PumpArenaRelease(); // v1.0.68.0: the deferred release of the AUTO waiters of an ended session
             // v1.0.68.0: the hero has gone far from the place where the duel was taken (another city, a teleport that the session did not
             // see): the arena session is over, the AUTO waiters of it follow him (the far ones stay as AUTO, a teleport carries them).
-            if (g_bArenaSessionHold)
+            GEBool const awaitingEntry = g_bArenaAdoptPending ? GETrue : PollArenaEntry();
+            if (g_bArenaSessionHold && !awaitingEntry)
             {
                 Entity SessionHero = Entity::GetPlayer();
                 if (SessionHero != None && DistanceFromSessionStart(SessionHero.GetPosition()) > ARENA_SESSION_LEAVE_DISTANCE)
@@ -4136,7 +2044,7 @@ namespace RequirementsCheck
                 g_bLostToThirdParty = GEFalse;
                 g_bThirdPartyMessage = GEFalse;
                 g_u32TabooUntil = ::GetTickCount() + TABOO_AFTER_MS;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] The duel is over: the opponent '%s' keeps away from the army "
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] The duel is over: the opponent '%s' keeps away from the army "
                                              "for %u ms.\n",
                                              g_strArenaOpponent.GetText(), static_cast<unsigned>(TABOO_AFTER_MS));
             }
@@ -4149,7 +2057,7 @@ namespace RequirementsCheck
                 return;
             g_bThirdPartyMessage = GETrue;
             // v1.0.59.0: the artificial line "Бой проигран! Соперника победил не игрок!" is removed: the loss is silent, only logged.
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] The duel is lost: the opponent was not beaten by the hero.\n");
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix] The duel is lost: the opponent was not beaten by the hero.\n");
         }
 
         void ResetDuelState()
@@ -4157,6 +2065,10 @@ namespace RequirementsCheck
             for (GEInt i = 0; i < WAITER_MAX; ++i)
                 g_arrWaiters[i] = bCString();
             g_iWaiterCount = 0;
+            g_bArenaEntryLoaded = GEFalse;
+            g_bArenaEntryCenterKnown = GEFalse;
+            g_u32ArenaCenterRetry = 0;
+            g_bArenaEntryPending = GEFalse; // Persistent entry events are read from the next world's player memory.
             ResetWaiterMarks(); // v1.0.68.0: a new world: no marks, no arena session (a waiting companion without a mark counts as USER)
             g_bArenaAdoptPending = GEFalse; // v1.1.1.0: SessionStart arms it again right after the load, once the world is reset
             g_bDuelWasActive = GEFalse;
@@ -4188,20 +2100,7 @@ namespace RequirementsCheck
         // a test with the demon potion has no beast-form line at all, so the game's flag was false for GetPlayer(). The
         // sure sign is the body itself: the transformation makes the spawned creature the player (the hits of the hero came
         // from "Transform_Demon_Potion"), and the own body of the hero is the entity "PC_Hero".
-        GEBool IsHeroTransformedNow()
-        {
-            // v1.0.34.0: the body of a form ("Transform_*") answers IsNPC() == false (the log shows faction -1 / party type -1
-            // for it), so IsNPC() must NOT be required here, otherwise a demon was taken for the human form.
-            Entity Hero = Entity::GetPlayer();
-            if (Hero == None)
-                return GEFalse;
-            if (Hero.IsNPC() && Hero.NPC.IsTransformed())
-                return GETrue;
-            bCString const strName = Hero.GetName();
-            if (strName.GetText() == nullptr || strName.GetText()[0] == 0)
-                return GEFalse;
-            return _stricmp(strName.GetText(), "PC_Hero") != 0 ? GETrue : GEFalse;
-        }
+
 
         // v1.0.48.0: THE SAFETY LOCK of every duel hook (the preemptive warning, the detectors of the damage of the arena): the
         // hero is in a monster body, or is not a humanoid, or does not exist -> the duel checks are skipped and the original
@@ -4219,107 +2118,8 @@ namespace RequirementsCheck
             return GEFalse;
         }
 
-        // The BODY OF THE FORM: the log of the demon test shows that the hits of the hero come from an entity named
-        // "Transform_Demon_Potion" while GetPlayer() never returned it (no beast-form diagnostics were ever written, they are
-        // all guarded by "the player is not PC_Hero"). So the transformation spawns a separate creature (the template
-        // "Transform_<form>[_Potion]") for the hero, and the NPCs of the world see THAT creature, not the hero entity. The
-        // world judges it by the faction / species rules of a monster (a non-humanoid with the faction None -> every
-        // humanoid, a slave included, takes it for an enemy). It is told by the name of its template.
-        GEBool IsHeroFormEntity(Entity &a_Npc)
-        {
-            // v1.0.34.0: no IsNPC() here - the body of the form is not an NPC for the wrapper.
-            if (a_Npc == None || a_Npc == Entity::GetPlayer())
-                return GEFalse;
-            bCString const strName = a_Npc.GetName();
-            return _strnicmp(strName.GetText(), "Transform_", 10) == 0 ? GETrue : GEFalse;
-        }
 
-        GEBool IsHeroControlled(Entity &a_Npc)
-        {
-            Entity Hero = Entity::GetPlayer();
-            if (a_Npc == None || a_Npc == Hero || !a_Npc.IsNPC())
-                return GEFalse;
-            Entity Leader = a_Npc.Party.GetPartyLeader();
-            GEBool bLeaderIsHero = Leader == Hero;
-            // The beast form: the transformation (MagicTransform -> StartTransform) makes the spawned creature the player
-            // (GetPlayer() returns it), while the party of the hero still belongs to his own body "PC_Hero", which is
-            // hidden meanwhile. The army follows the master in any form, so that body counts as the master too.
-            if (!bLeaderIsHero && Leader != None && IsHeroTransformedNow())
-            {
-                Entity Body = Entity::GetEntity(bCString("PC_Hero"));
-                if (Body != None)
-                {
-                    if (a_Npc == Body)
-                        return GEFalse;
-                    bLeaderIsHero = Leader == Body;
-                }
-            }
-            if (!bLeaderIsHero)
-                return GEFalse;
-            return a_Npc.Party.PartyMemberType != gEPartyMemberType_None ? GETrue : GEFalse;
-        }
 
-        GEBool IsRedForHero(Entity &a_Npc)
-        {
-            gEAttitude const enuAttitude = AI_Decision::GetAttitudeToPlayer(a_Npc);
-            return enuAttitude == gEAttitude_Hostile || enuAttitude == gEAttitude_Predator;
-        }
-
-        // The NPC who made the damage: the damaging object itself (melee: the attacker) or the owner up its chain.
-        Entity GetDamageOwnerNpc(Entity &a_Source)
-        {
-            Entity Current = a_Source;
-            for (GEInt i = 0; i < 4 && Current != None; ++i)
-            {
-                // v1.0.34.0: the hero in a transformed body is not an NPC for the wrapper, but he is the attacker all the same.
-                if (Current.IsNPC() || IsHeroSide(Current))
-                    return Current;
-                if (!Current.Interaction.IsValid())
-                    break;
-                Entity Owner = Current.Interaction.GetOwner();
-                if (Owner == None || Owner == Current)
-                    break;
-                Current = Owner;
-            }
-            return Entity();
-        }
-
-        // True: the controlled creature must not kill this victim (any NPC / beast / monster that is not red for the hero).
-        GEBool FollowerMustSpare(Entity &a_Attacker, Entity &a_Victim, GELPCChar a_strWhere)
-        {
-            if (a_Attacker == None || a_Victim == None || a_Attacker == a_Victim || !a_Victim.IsNPC())
-                return GEFalse;
-            if (!IsHeroControlled(a_Attacker))
-                return GEFalse;
-            if (a_Victim == Entity::GetPlayer() || IsHeroControlled(a_Victim))
-                return GEFalse;
-            // The ORIGINAL rule of the game stays for every attacker that is not a humanoid (animals, monsters, ...): the
-            // native IsDeadlyDamage asks IsHumanoid of BOTH sides and, when one of them is not, the blow is deadly at once.
-            // Only a humanoid attacker (a humanoid companion / summon) fighting a humanoid can leave the other knocked
-            // down - and only there the hero's "not a red enemy" rule below makes sense. So a wolf, a snapper or a monster
-            // of the party kills everybody it brawls with, as it always did.
-            if (!AI_Decision::IsHumanoid(a_Attacker))
-                return GEFalse;
-            // Only a creature that CAN be knocked down is spared. The game itself tells them apart: IsDeadlyDamage /
-            // HasAttackReasonToKill ask IsHumanoid of the victim (an animal, a monster, ... has no knock-down animation and
-            // always dies), so those are never spared, whatever their attitude to the hero is.
-            if (!AI_Decision::IsHumanoid(a_Victim))
-                return GEFalse;
-            if (IsRedForHero(a_Victim))
-                return GEFalse; // a fight to the death against a real enemy of the hero
-            static GEInt s_iLines = 0;
-            if (s_iLines < 80)
-            {
-                ++s_iLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] %s: '%s' (controlled by the hero, party type %d) must not "
-                                             "kill '%s': he is not red for the hero (attitude %d).\n",
-                                             a_strWhere, a_Attacker.GetName().GetText(),
-                                             static_cast<int>(a_Attacker.Party.PartyMemberType),
-                                             a_Victim.GetName().GetText(),
-                                             static_cast<int>(AI_Decision::GetAttitudeToPlayer(a_Victim)));
-            }
-            return GETrue;
-        }
     } // namespace
 
     //
@@ -4330,43 +2130,13 @@ namespace RequirementsCheck
     //
     namespace
     {
-        void OnHeroSummonCast(GELPCChar a_strScript, gCScriptProcessingUnit *a_pSPU, GELPVoid a_pSelfEntity,
-                              GELPVoid a_pOtherEntity)
-        {
-            static GEBool s_bBusy = GEFalse;
-            if (s_bBusy)
-                return;
-            Entity Hero = Entity::GetPlayer();
-            Entity Self = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-            Entity Other = ResolveEntity(a_pOtherEntity, a_pSPU->GetOtherEntity());
-            // The caster is the hero, or the hero is in his magic task (the script may run on the spell entity).
-            if (!(Self == Hero) && !(Other == Hero) && !IsHeroCasting(Hero))
-                return;
-            // v1.0.40.0: the punishment is given by the state tracker (PS_Magic_Summon / PS_Magic_QuickCast), not here: this
-            // hook only logs a summon cast inside the ring.
-            if (!HasRunningArenaQuest() || !IsHeroInsideArenaZone())
-                return; // no duel / outside the ring: summoning is free
-            static GEInt s_iLines = 0;
-            if (s_iLines < 60)
-            {
-                ++s_iLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix][diag] arena: the hero casts a summon (%s, self='%s', "
-                                             "other='%s', last spell='%s') -> the crowd reacts at once\n",
-                                             a_strScript, Self != None ? Self.GetName().GetText() : "-",
-                                             Other != None ? Other.GetName().GetText() : "-",
-                                             bCString(Hero.NPC.LastSpell).GetText());
-            }
-            s_bBusy = GETrue;
-            s_bBusy = GEFalse;
-        }
+
     } // namespace
 
-#define GLF_SUMMON_HOOK(NAME)                                                                                          \
-    ME_DEFINE_AND_HOOK_SCRIPT(NAME)                                                                                    \
-    {                                                                                                                  \
-        GEInt const iResult = NAME##_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);                         \
-        OnHeroSummonCast(#NAME, a_pSPU, a_pSelfEntity, a_pOtherEntity);                                                \
-        return iResult;                                                                                                \
+#define GLF_SUMMON_HOOK(NAME) \
+    ME_DEFINE_AND_HOOK_SCRIPT(NAME) \
+    { \
+        return GroupLogic::Lifecycle::SummonCast(NAME##_Original, #NAME, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs); \
     }
 
     //
@@ -4380,54 +2150,14 @@ namespace RequirementsCheck
     //
     namespace
     {
-        GEBool IsHeroHealSpell(bCString const &a_strSpell, GEInt &o_iCastType, bCString &o_strHitFunc)
-        {
-            GEInt iSpellType = -1;
-            bCString strCastFunc;
-            GetSpellDamageType(a_strSpell, iSpellType, strCastFunc, &o_iCastType, &o_strHitFunc);
-            if (iSpellType < 0)
-                return GEFalse;
-            // The spells that replace a consumable: heal himself, cure poison, cure weakness (disease). The potions with
-            // these effects are forbidden in the arena as well. MagicHealOther is NOT in the list.
-            return (_stricmp(o_strHitFunc.GetText(), "MagicHeal") == 0 ||
-                    _stricmp(o_strHitFunc.GetText(), "MagicCurePoison") == 0 ||
-                    _stricmp(o_strHitFunc.GetText(), "MagicCureDisease") == 0) &&
-                   o_iCastType == static_cast<GEInt>(gECastType_Regular);
-        }
 
-        void OnHeroHealCast(GELPCChar a_strScript, gCScriptProcessingUnit *a_pSPU, GELPVoid a_pSelfEntity)
-        {
-            Entity Hero = Entity::GetPlayer();
-            Entity Self = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-            // The hero casts it himself (his magic task; a potion is PS_MagicPotion and is handled by the consumable hook).
-            if (!(Self == Hero) || !IsHeroCasting(Hero))
-                return;
-            // v1.0.40.0: with a Running arena quest and the hero in the ring the magic is judged by the state tracker (the
-            // cast state is the punishment, for every spell). The old consumable rule below only covers a duel without quest.
-            if (HasRunningArenaQuest() && IsHeroInsideArenaZone())
-                return;
-            if (!IsArenaFightStarted() || !IsHeroInsideArenaZone())
-                return;
-            GEInt iCastType = -1;
-            bCString strHitFunc;
-            bCString const strSpell = Hero.NPC.LastSpell;
-            GEBool const bHeal = IsHeroHealSpell(strSpell, iCastType, strHitFunc);
-            GetDefaultLogger().LogFormat("[GenomeLogicFix][diag] arena: the hero casts %s (spell '%s', cast type=%d, "
-                                         "hit script '%s') -> %s\n",
-                                         a_strScript, strSpell.GetText(), static_cast<int>(iCastType),
-                                         strHitFunc.GetText(),
-                                         bHeal ? "a heal / cure like a consumable" : "left alone (fast variant / unknown)");
-            if (bHeal)
-                OnHeroConsumeStarted();
-        }
+
     } // namespace
 
-#define GLF_HEAL_HOOK(NAME)                                                                                            \
-    ME_DEFINE_AND_HOOK_SCRIPT(NAME)                                                                                    \
-    {                                                                                                                  \
-        GEInt const iResult = NAME##_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);                         \
-        OnHeroHealCast(#NAME, a_pSPU, a_pSelfEntity);                                                                  \
-        return iResult;                                                                                                \
+#define GLF_HEAL_HOOK(NAME) \
+    ME_DEFINE_AND_HOOK_SCRIPT(NAME) \
+    { \
+        return GroupLogic::Lifecycle::HealCast(NAME##_Original, #NAME, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs); \
     }
 
     GLF_HEAL_HOOK(MagicHeal)
@@ -4436,83 +2166,10 @@ namespace RequirementsCheck
 
     namespace
     {
-        // The hero (any entity of his side) in a TRANSFORMED body: the body of the form ("Transform_*"), the player entity of
-        // the form or his hidden human body while the form lasts.
-        GEBool IsHeroAttackerInForm(Entity &a_Attacker)
-        {
-            return IsHeroFormEntity(a_Attacker) || (IsHeroSide(a_Attacker) && IsHeroTransformedNow());
-        }
 
-        // A SINGLE-TARGET MAGIC PROJECTILE of the hero (a fireball, an ice lance, a lightning bolt): the damaging object is
-        // not a creature (a blow of a weapon comes with the attacker himself as the object, an arrow is not elemental) and
-        // carries an elemental damage type of its own (the type stored on the victim is not used, it belongs to the previous
-        // hit). An area spell never comes here: it reaches Entity::DoDamage (a_bAreaDamage = true).
-        GEBool IsPointMagicSource(Entity *a_pSource)
-        {
-            if (!a_pSource || *a_pSource == None || a_pSource->IsNPC() || IsHeroSide(*a_pSource))
-                return GEFalse;
-            // v1.0.34.0: a PHYSICAL projectile is never magic: an arrow / a bolt carries the damage type Missile (a blade /
-            // impact / physics object likewise), whatever the hero cast before.
-            if (a_pSource->Damage.IsValid())
-            {
-                gEDamageType const enuOwn = a_pSource->Damage.DamageType;
-                if (enuOwn == gEDamageType_Missile || enuOwn == gEDamageType_Blade)
-                    return GEFalse;
-            }
-            return GetSourceElementalType(*a_pSource) != gEDamageType_None ? GETrue : GEFalse;
-        }
 
-        // FRIENDLY FIRE (v1.0.34.0, rules of 1.0.33.0). The hero damages a member of his army (party types 1..5):
-        //  1. The hero in ANY TRANSFORMED FORM (a demon, a wolf, a bloodfly, a gorge ...): ALWAYS blocked, everything.
-        //  2. The hero in the HUMAN FORM (PC_Hero):
-        //     - any melee blow, any shot of a bow / crossbow, any area spell (a_bAreaDamage = true: meteor, fire rain, frost
-        //       wave ...): ALWAYS blocked (IsFriendlyFire = true);
-        //     - the ONLY exception: a single-target magic projectile of the hero shot at a creature of his party (a fireball,
-        //       an ice lance, a lightning bolt): passes (IsFriendlyFire = false); it opens the manual counter of the brawl.
-        //  3. Both the attacker and the victim are of the army: always blocked.
-        GEBool IsFriendlyFire(Entity &a_Attacker, Entity &a_Victim, GEBool a_bAreaDamage, Entity *a_pSource)
-        {
-            if (a_Attacker == None || a_Victim == None || a_Attacker == a_Victim)
-                return GEFalse;
-            if (!IsHeroControlled(a_Victim))
-                return GEFalse;
-            GEBool const bHeroSide = IsHeroSide(a_Attacker);
-            if (!bHeroSide && !IsHeroControlled(a_Attacker))
-                return GEFalse;
-            if (bHeroSide)
-            {
-                GEBool const bForm = IsHeroAttackerInForm(a_Attacker);
-                if (!bForm && !a_bAreaDamage && IsPointMagicSource(a_pSource))
-                    return GEFalse; // the one exception: a point magic projectile of the human form
-                static GEInt s_iHeroLines = 0;
-                if (s_iHeroLines < 60)
-                {
-                    ++s_iHeroLines;
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix] Damage of the hero ('%s', %s%s) on '%s' (party type %d) is "
-                                                 "blocked.\n",
-                                                 a_Attacker.GetName().GetText(), bForm ? "transformed" : "human form",
-                                                 a_bAreaDamage ? ", area" : "", a_Victim.GetName().GetText(),
-                                                 static_cast<int>(a_Victim.Party.PartyMemberType));
-                }
-                return GETrue;
-            }
-            static GEInt s_iLines = 0;
-            if (s_iLines < 60)
-            {
-                ++s_iLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Friendly fire inside the army of the hero is blocked: '%s' "
-                                             "(party type %d) -> '%s' (party type %d).\n",
-                                             a_Attacker.GetName().GetText(),
-                                             static_cast<int>(a_Attacker.Party.PartyMemberType),
-                                             a_Victim.GetName().GetText(),
-                                             static_cast<int>(a_Victim.Party.PartyMemberType));
-            }
-            return GETrue;
-        }
-        GEBool IsHeroInBeastForm()
-        {
-            return IsHeroTransformedNow();
-        }
+
+
     } // namespace
 
     //
@@ -4523,190 +2180,20 @@ namespace RequirementsCheck
     //
     namespace
     {
-        GEBool IsPrimaryAggressionOnSummon(Entity &a_Self, Entity &a_Other)
-        {
-            if (a_Self == None || a_Other == None || !a_Self.IsNPC() || !a_Other.IsNPC())
-                return GEFalse;
-            if (a_Self == Entity::GetPlayer() || a_Self == a_Other || IsHeroControlled(a_Self))
-                return GEFalse;
-            if (a_Self.NPC.PoliticalAlignment != gEPoliticalAlignment_None)
-                return GEFalse;
-            if (a_Other.Party.PartyMemberType != gEPartyMemberType_Summoned || !IsHeroControlled(a_Other))
-                return GEFalse;
-            // The summon has already hurt him: the fight is legal.
-            if (a_Self.NPC.GetCurrentAttacker() == a_Other || a_Self.NPC.GetLastAttacker() == a_Other)
-                return GEFalse;
-            return GETrue;
-        }
+
 
         // ONE FOR ALL, ALL FOR ONE: the outsiders who attack a member of the army, remembered by name for a while.
-        GEInt const DEFEND_MAX = 16;
-        GEU32 const DEFEND_MS = 20000;
-        GEFloat const DEFEND_RADIUS = 2500.0f;
-        bCString g_arrDefendNames[DEFEND_MAX];
-        GEU32 g_arrDefendTick[DEFEND_MAX] = {};
 
-        GEBool IsDefendedTarget(bCString const &a_strName)
-        {
-            GEU32 const u32Now = ::GetTickCount();
-            for (GEInt i = 0; i < DEFEND_MAX; ++i)
-                if (g_arrDefendTick[i] != 0 && g_arrDefendNames[i] == a_strName &&
-                    static_cast<GEInt>(u32Now - g_arrDefendTick[i]) < static_cast<GEInt>(DEFEND_MS))
-                    return GETrue;
-            return GEFalse;
-        }
 
-        void ClearDefendedTargets()
-        {
-            // The full reset of the fight records (v1.0.30.0: they used to be wiped on EVERY attitude query, inside
-            // IsDefendedTarget, which also erased the timer "the hero struck" and the records of the brawl).
-            ClearFocusRecords();
-            ClearCombatRecords();
-            ClearBrawls();
-            for (GEInt i = 0; i < DEFEND_MAX; ++i)
-            {
-                g_arrDefendNames[i] = bCString();
-                g_arrDefendTick[i] = 0;
-            }
-        }
 
-        void RememberDefendedTarget(bCString const &a_strName)
-        {
-            GEU32 const u32Now = ::GetTickCount();
-            GEInt iFree = -1;
-            for (GEInt i = 0; i < DEFEND_MAX; ++i)
-            {
-                if (g_arrDefendTick[i] != 0 && g_arrDefendNames[i] == a_strName)
-                {
-                    g_arrDefendTick[i] = u32Now;
-                    return;
-                }
-                if (iFree < 0 && (g_arrDefendTick[i] == 0 ||
-                                  static_cast<GEInt>(u32Now - g_arrDefendTick[i]) >= static_cast<GEInt>(DEFEND_MS)))
-                    iFree = i;
-            }
-            if (iFree < 0)
-                iFree = 0;
-            g_arrDefendNames[iFree] = a_strName;
-            g_arrDefendTick[iFree] = u32Now;
-        }
     } // namespace
     namespace
     {
         // FOCUS RECORDS: who (an outsider) took whom (a member of the army) for a target in AssessTarget, and when.
-        GEInt const FOCUS_MAX = 24;
-        GEU32 const FOCUS_MS = 15000;
-        bCString g_arrFocusEnemy[FOCUS_MAX];
-        bCString g_arrFocusVictim[FOCUS_MAX];
-        GEU32 g_arrFocusTick[FOCUS_MAX] = {};
 
-        void NoteFocusRecord(bCString const &a_strEnemy, bCString const &a_strVictim)
-        {
-            GEU32 const u32Now = ::GetTickCount();
-            GEInt iFree = -1;
-            for (GEInt i = 0; i < FOCUS_MAX; ++i)
-            {
-                if (g_arrFocusTick[i] != 0 && g_arrFocusEnemy[i] == a_strEnemy && g_arrFocusVictim[i] == a_strVictim)
-                {
-                    g_arrFocusTick[i] = u32Now;
-                    return;
-                }
-                if (iFree < 0 && (g_arrFocusTick[i] == 0 ||
-                                  static_cast<GEInt>(u32Now - g_arrFocusTick[i]) >= static_cast<GEInt>(FOCUS_MS)))
-                    iFree = i;
-            }
-            if (iFree < 0)
-                iFree = 0;
-            g_arrFocusEnemy[iFree] = a_strEnemy;
-            g_arrFocusVictim[iFree] = a_strVictim;
-            g_arrFocusTick[iFree] = u32Now;
-        }
 
-        GEBool HasFocusRecord(bCString const &a_strEnemy, bCString const &a_strVictim)
-        {
-            GEU32 const u32Now = ::GetTickCount();
-            for (GEInt i = 0; i < FOCUS_MAX; ++i)
-                if (g_arrFocusTick[i] != 0 && g_arrFocusEnemy[i] == a_strEnemy && g_arrFocusVictim[i] == a_strVictim &&
-                    static_cast<GEInt>(u32Now - g_arrFocusTick[i]) < static_cast<GEInt>(FOCUS_MS))
-                    return GETrue;
-            return GEFalse;
-        }
 
-        void ClearFocusRecords()
-        {
-            for (GEInt i = 0; i < FOCUS_MAX; ++i)
-            {
-                g_arrFocusEnemy[i] = bCString();
-                g_arrFocusVictim[i] = bCString();
-                g_arrFocusTick[i] = 0;
-            }
-        }
 
-        // a_Victim: the member of the army (or the hero) who is attacked / taken into focus, a_Attacker: the outsider.
-        // Every free (or waiting) creature of the army in sight takes the outsider for an enemy and attacks him.
-        void DefendAllies(Entity &a_Victim, Entity &a_Attacker)
-        {
-            static GEBool s_bBusy = GEFalse;
-            if (s_bBusy || a_Victim == None || a_Attacker == None || a_Victim == a_Attacker)
-                return;
-            Entity Hero = Entity::GetPlayer();
-            if (!a_Attacker.IsNPC() || a_Attacker.IsDead() || IsHeroSide(a_Attacker))
-                return;
-            // The hero (any form) hitting a member of his army is an internal brawl: nobody defends, nobody attacks.
-            if (IsHeroSide(a_Attacker) || IsDuelTaboo(a_Attacker))
-                return;
-            if (!IsHeroControlled(a_Victim))
-                return;
-            if (IsHeroControlled(a_Attacker))
-                return; // inside the army nobody is an enemy
-            Entity Opponent;
-            if (FindArenaOpponent(Opponent) && Opponent == a_Attacker)
-                return; // the duel opponent is the business of the arena rules
-            s_bBusy = GETrue;
-            RememberDefendedTarget(a_Attacker.GetName());
-            // the waiting ones stay in the tribune until the squad is released (the quest runs, or the release is pending)
-            GEBool const bQuest = HasRunningArenaQuest() || g_bDuelWasActive;
-            GEInt iHelpers = 0;
-            bTObjArray<Entity> arrNPCs = Entity::GetNPCs();
-            for (GEInt i = 0; i < arrNPCs.GetCount(); ++i)
-            {
-                Entity Ally = arrNPCs.GetAt(i);
-                if (Ally == a_Victim || Ally == Hero || Ally == a_Attacker || Ally.IsDead() || Ally.IsDown())
-                    continue;
-                if (!IsHeroControlled(Ally) || Ally.NPC.GetCurrentTarget() == a_Attacker)
-                    continue;
-                if (Ally.GetDistanceTo(a_Attacker) > DEFEND_RADIUS || !Ally.IsFreeLOS(a_Attacker, GEFalse))
-                    continue;
-                // Free = fights nobody; a waiting one is called as well, but not out of the ring of a running duel.
-                GEBool const bWaiting = Ally.Party.Waiting;
-                if (!bWaiting && !IsPeaceful(Ally))
-                    continue;
-                if (bWaiting && bQuest && IsInsideArenaZone(Ally))
-                    continue;
-                if (bWaiting)
-                    Ally.Party.Waiting = GEFalse;
-                Ally.Routine.FullStop();
-                AI_Perception::AssessTarget(Ally, a_Attacker, gEAttackReason_Enemy);
-                if (!(Ally.NPC.GetCurrentTarget() == a_Attacker) || !HasTask(Ally, "ZS_Attack"))
-                {
-                    Ally.NPC.SetCurrentTarget(a_Attacker);
-                    Ally.NPC.AttackReason = gEAttackReason_Enemy;
-                    Ally.Routine.SetTask("ZS_Attack");
-                }
-                ++iHelpers;
-            }
-            s_bBusy = GEFalse;
-            static GEInt s_iLines = 0;
-            if (iHelpers > 0 && s_iLines < 60)
-            {
-                ++s_iLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Mutual defence: '%s' attacks '%s' (party type %d) -> %d "
-                                             "member(s) of the army attack him.\n",
-                                             a_Attacker.GetName().GetText(), a_Victim.GetName().GetText(),
-                                             static_cast<int>(a_Victim.Party.PartyMemberType),
-                                             static_cast<int>(iHelpers));
-            }
-        }
     } // namespace
     //
     // v1.0.36.0: TWO POLITICAL FILTERS of the automatic aggression (AssessTarget / GetAttitude / GetAttitudeToPlayer).
@@ -4721,95 +2208,13 @@ namespace RequirementsCheck
     //
     namespace
     {
-        // v1.0.38.0: the Wanderers / Druids are known by their NATIVE political status gEPoliticalAlignment_Mid (the template
-        // of Arakos in g3dit, PSNpc.PoliticalAlignment). The old parsing of the names (Ranger_*, druid, wanderer) is gone.
-        GEBool IsWandererNpc(Entity &a_Npc)
-        {
-            if (a_Npc == None || !a_Npc.IsNPC())
-                return GEFalse;
-            return a_Npc.NPC.PoliticalAlignment == gEPoliticalAlignment_Mid ? GETrue : GEFalse;
-        }
 
-        // The target is the hero in a transformed body (the player entity of the form or the body of the form).
-        GEBool IsTransformedHeroTarget(Entity &a_Other)
-        {
-            if (a_Other == None)
-                return GEFalse;
-            if (IsHeroFormEntity(a_Other))
-                return GETrue;
-            return a_Other == Entity::GetPlayer() && IsHeroTransformedNow() ? GETrue : GEFalse;
-        }
 
-        // The hero (any form) or his creature has already hurt this NPC: the fight is legal, no filter.
-        GEBool HasBeenHurtBy(Entity &a_Self, Entity &a_Other)
-        {
-            Entity Cur = a_Self.NPC.GetCurrentAttacker();
-            Entity Last = a_Self.NPC.GetLastAttacker();
-            if (Cur != None && (IsHeroSide(Cur) || IsHeroControlled(Cur) || Cur == a_Other))
-                return GETrue;
-            if (Last != None && (IsHeroSide(Last) || IsHeroControlled(Last) || Last == a_Other))
-                return GETrue;
-            return GEFalse;
-        }
 
-        // The alignment of the target for the rule 5. The body of a form is no NPC for the wrapper: the alignment of the
-        // hero is then read from his own hidden body PC_Hero.
-        // v1.0.38.0: the alignment is read STRICTLY from the entity that is the target right now - the active body of the
-        // form (Transform_*, the current player entity) or the creature of the party (types 1..5). The human PC_Hero is never
-        // read. The body of a form is no NPC for the wrapper (IsNPC() == false), so the property set itself is asked.
-        GEBool IsSlaveTarget(Entity &a_Other)
-        {
-            if (a_Other == None || (IsHeroSide(a_Other) && !IsTransformedHeroTarget(a_Other)))
-                return GEFalse; // the human body of the hero (PC_Hero / the player in his own body): excluded
-            if (_stricmp(a_Other.GetName().GetText(), "PC_Hero") == 0)
-                return GEFalse;
-            if (!a_Other.NPC.IsValid())
-                return GEFalse;
-            return a_Other.NPC.PoliticalAlignment == gEPoliticalAlignment_Slave ? GETrue : GEFalse;
-        }
 
-        // Rule 5. a_Self: the one who would become aggressive, a_Other: the target.
-        GEBool IsSlaveVsNoneBlocked(Entity &a_Self, Entity &a_Other)
-        {
-            if (a_Self == None || a_Other == None || !a_Self.IsNPC() || a_Self == a_Other)
-                return GEFalse;
-            if (a_Self == Entity::GetPlayer() || IsHeroControlled(a_Self) || IsHeroSide(a_Self))
-                return GEFalse;
-            if (a_Self.IsDead() || !AI_Decision::IsHumanoid(a_Self) || a_Self.NPC.PoliticalAlignment != gEPoliticalAlignment_None)
-                return GEFalse;
-            if (!IsPeaceful(a_Self) || HasBeenHurtBy(a_Self, a_Other))
-                return GEFalse;
-            if (IsSentAgainstHero(a_Self)) // v1.0.67.0: the crowd of the crime fights the form like the man
-                return GEFalse;
-            if (!IsSlaveTarget(a_Other))
-                return GEFalse;
-            GEBool const bForm = IsTransformedHeroTarget(a_Other);
-            GEBool const bParty = a_Other.IsNPC() && IsHeroControlled(a_Other); // party types 1..5
-            return bForm || bParty ? GETrue : GEFalse;
-        }
 
-        // Rule 6.
-        GEBool IsWandererImmune(Entity &a_Self, Entity &a_Other)
-        {
-            if (!IsWandererNpc(a_Self) || a_Self.IsDead() || a_Self == a_Other)
-                return GEFalse;
-            if (!IsTransformedHeroTarget(a_Other))
-                return GEFalse;
-            if (IsSentAgainstHero(a_Self)) // v1.0.67.0: sent against the hero by the plugin
-                return GEFalse;
-            // The hero attacked a Wanderer first: the native rules (and the aggression) apply.
-            return HasBeenHurtBy(a_Self, a_Other) ? GEFalse : GETrue;
-        }
 
-        void LogPoliticalFilter(GELPCChar a_strWhere, GELPCChar a_strRule, Entity &a_Self, Entity &a_Other)
-        {
-            static GEInt s_iLines = 0;
-            if (s_iLines >= 60)
-                return;
-            ++s_iLines;
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] %s: %s - '%s' keeps calm towards '%s'.\n", a_strWhere, a_strRule,
-                                         a_Self.GetName().GetText(), a_Other.GetName().GetText());
-        }
+
     } // namespace
 
     //
@@ -4826,72 +2231,23 @@ namespace RequirementsCheck
     //
     namespace
     {
-        GEBool IsFormWeaponBlocked(Entity &a_Self, Entity &a_Other)
-        {
-            if (a_Self == None || a_Other == None || !a_Self.IsNPC() || a_Self.IsDead())
-                return GEFalse;
-            if (a_Self == a_Other || IsHeroSide(a_Self) || IsHeroControlled(a_Self))
-                return GEFalse;
-            if (!IsTransformedHeroTarget(a_Other))
-                return GEFalse;
-            // v1.0.67.0: sent against the hero by the plugin (the crowd of the crime, the duel opponent): the form is the same enemy for
-            // him as the human body was - the claws are a weapon for him.
-            if (IsSentAgainstHero(a_Self))
-                return GEFalse;
-            // The hero already hit him: the fight is legal.
-            if (HasBeenHurtBy(a_Self, a_Other))
-                return GEFalse;
-            // He already fights the hero, or takes him for an enemy.
-            if (a_Self.NPC.GetCurrentTarget() == a_Other && a_Self.NPC.AttackReason != gEAttackReason_None)
-                return GEFalse;
-            gEAttitude const enuAttitude = AI_Decision::GetAttitudeToPlayer(a_Self);
-            if (enuAttitude == gEAttitude_Angry || enuAttitude == gEAttitude_Hostile || enuAttitude == gEAttitude_Predator)
-                return GEFalse;
-            return GETrue;
-        }
 
-        void LogFormWeapon(GELPCChar a_strWhere, Entity &a_Self, Entity &a_Other)
-        {
-            static GEInt s_iLines = 0;
-            if (s_iLines >= 40)
-                return;
-            ++s_iLines;
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] %s: the built-in weapon of the form '%s' is no threat for '%s'.\n",
-                                         a_strWhere, a_Other.GetName().GetText(), a_Self.GetName().GetText());
-        }
+
     } // namespace
 
-    ME_DEFINE_AND_HOOK_SCRIPT(AssessPlayerWeapon)
+        ME_DEFINE_AND_HOOK_SCRIPT(AssessPlayerWeapon)
     {
-        Entity Self = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-        Entity Other = ResolveEntity(a_pOtherEntity, a_pSPU->GetOtherEntity());
-        if (IsFormWeaponBlocked(Self, Other))
-        {
-            LogFormWeapon("AssessPlayerWeapon", Self, Other);
-            return 0;
-        }
-        return AssessPlayerWeapon_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
+        return SocialLogic::Hooks::AssessPlayerWeapon(AssessPlayerWeapon_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
     }
 
-    ME_DEFINE_AND_HOOK_SCRIPT(AssessWarn)
+        ME_DEFINE_AND_HOOK_SCRIPT(AssessWarn)
     {
-        Entity Self = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-        Entity Other = ResolveEntity(a_pOtherEntity, a_pSPU->GetOtherEntity());
-        if (IsFormWeaponBlocked(Self, Other))
-        {
-            LogFormWeapon("AssessWarn", Self, Other);
-            return 0;
-        }
-        return AssessWarn_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
+        return SocialLogic::Hooks::AssessWarn(AssessWarn_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
     }
 
-    ME_DEFINE_AND_HOOK_SCRIPT(CanThreaten)
+        ME_DEFINE_AND_HOOK_SCRIPT(CanThreaten)
     {
-        Entity Self = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-        Entity Other = ResolveEntity(a_pOtherEntity, a_pSPU->GetOtherEntity());
-        if (IsFormWeaponBlocked(Self, Other))
-            return 0;
-        return CanThreaten_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
+        return SocialLogic::Hooks::CanThreaten(CanThreaten_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
     }
 
     // The choice of a target (the script that switches an NPC to ZS_Attack).
@@ -4899,127 +2255,14 @@ namespace RequirementsCheck
     //     ...), the body of the form or another creature of his army for a target.
     //  2. An NPC of the faction None never chooses a summon of the hero as a target before the summon hurts him first.
     //  3. When an outsider takes a member of the army for a target, the free members of the army defend him.
-    ME_DEFINE_AND_HOOK_SCRIPT(AssessTarget)
+        ME_DEFINE_AND_HOOK_SCRIPT(AssessTarget)
     {
-        PollFleeWatch(); // diagnostics only
-        Entity Self = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-        Entity Other = ResolveEntity(a_pOtherEntity, a_pSPU->GetOtherEntity());
-        if (Self == None || Other == None)
-            return AssessTarget_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
-        Entity Hero = Entity::GetPlayer();
-        // v1.0.41.0: the opponent in the warning stance (the magic in the hand of the hero) does not take him for a target.
-        // v1.0.47.0: the very first order of the native code (the choice of the target) is blocked and replaced by the stance.
-        if ((Other == Hero || IsHeroSide(Other)) && (IsWarnedOpponent(Self) || PreemptMagicWarning(Self)))
-            return 0;
-        // v1.0.36.0: the political filters (rule 5: faction None vs a Slave target, rule 6: the Wanderers vs the hero in a
-        // transformed body). The automatic aggression is not started at all.
-        if (IsWandererImmune(Self, Other))
-        {
-            LogPoliticalFilter("AssessTarget", "a Wanderer sees a human in the beast form", Self, Other);
-            return 0;
-        }
-        if (IsSlaveVsNoneBlocked(Self, Other))
-        {
-            LogPoliticalFilter("AssessTarget", "faction None vs a Slave target (form / party creature)", Self, Other);
-            return 0;
-        }
-        // An OUTSIDER that has hit the army (or the hero) is in a real fight: from the first blow on the AI of the squad has
-        // full native freedom (the stumble, the retreat after a thrust, the answer). None of the filters below is applied -
-        // the target is never reset in the middle of a native micro-stumble. Only the duel taboo stays.
-        if (!IsDuelTaboo(Other) && !IsDuelTaboo(Self) && IsInRealFight(Self, Other))
-            return AssessTarget_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
-        if (IsHeroControlled(Self))
-        {
-            if (IsDuelTaboo(Other))
-            {
-                static GEInt s_iTabooLines = 0;
-                if (s_iTabooLines < 40)
-                {
-                    ++s_iTabooLines;
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix] AssessTarget: '%s' (party type %d) does not see the duel "
-                                                 "opponent '%s'.\n",
-                                                 Self.GetName().GetText(), static_cast<int>(Self.Party.PartyMemberType),
-                                                 Other.GetName().GetText());
-                }
-                return 0;
-            }
-            // The hidden human body of the hero counts as the master as well.
-            GEBool const bMaster = Other == Hero || IsHeroFormEntity(Other) ||
-                                   _stricmp(Other.GetName().GetText(), "PC_Hero") == 0;
-            // THE MASTER BLOCK: until the SECOND blow of the hero (the counter of the brawl) the creature never takes him for a
-            // target, the answer is a hard 0. The second blow opens the brawl slot, and only then the native answer passes.
-            if (bMaster && !IsBrawlFighting(Self))
-            {
-                static GEInt s_iHeroLines = 0;
-                if (s_iHeroLines < 40)
-                {
-                    ++s_iHeroLines;
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix] AssessTarget: '%s' (controlled by the hero) does not "
-                                                 "take his master '%s' for a target (transformed=%d).\n",
-                                                 Self.GetName().GetText(), Other.GetName().GetText(),
-                                                 static_cast<int>(IsHeroInBeastForm()));
-                }
-                return 0;
-            }
-            if (IsFriendlyFire(Self, Other))
-                return 0;
-            // The native rule of the army: no fight with an outsider before a REAL blow (he hurt the hero / the army, or
-            // the hero / the army hurt him). A mob that has only decided to attack the hero and runs at him is left alone.
-            if (ArmyMustNotAttack(Self, Other, a_iArgs))
-            {
-                static GEInt s_iNoLines = 0;
-                if (s_iNoLines < 60)
-                {
-                    ++s_iNoLines;
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix] AssessTarget: '%s' (party type %d) does not attack '%s': "
-                                                 "no real blow yet (attack reason %d).\n",
-                                                 Self.GetName().GetText(), static_cast<int>(Self.Party.PartyMemberType),
-                                                 Other.GetName().GetText(), static_cast<int>(a_iArgs));
-                }
-                return 0;
-            }
-            return AssessTarget_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
-        }
-        if (IsHeroControlled(Other) && IsDuelTaboo(Self))
-            return 0; // the duel opponent attacks nobody of the party of the hero
-        if (IsPrimaryAggressionOnSummon(Self, Other))
-        {
-            static GEInt s_iLines = 0;
-            if (s_iLines < 40)
-            {
-                ++s_iLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] AssessTarget: '%s' (no faction) ignores the summon '%s' of "
-                                             "the hero until it hurts him first.\n",
-                                             Self.GetName().GetText(), Other.GetName().GetText());
-            }
-            return 0;
-        }
-        GEInt const iResult = AssessTarget_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
-        // Native perception result: the outsider took a member of the army for his target = a recorded focus.
-        if (Self.IsNPC() && !Self.IsDead() && !IsHeroSide(Self) && IsHeroControlled(Other) &&
-            Self.NPC.GetCurrentTarget() == Other)
-            NoteFocusRecord(Self.GetName(), Other.GetName());
-        return iResult;
+        return PluginRuntime::Combat::AssessTarget(AssessTarget_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
     }
 
     namespace
     {
-        // The hero in a transformed body (the player is the spawned creature, or the body "Transform_*"): the hidden
-        // human body "PC_Hero" is the entity that the native fight scripts were written for. Fills a_Body with it.
-        GEBool FindHumanBodyFor(Entity &a_Attacker, Entity &a_Body)
-        {
-            if (a_Attacker == None || !a_Attacker.IsNPC())
-                return GEFalse;
-            GEBool const bForm = IsHeroFormEntity(a_Attacker) ||
-                                 (a_Attacker == Entity::GetPlayer() && IsHeroTransformedNow());
-            if (!bForm)
-                return GEFalse;
-            Entity Body = Entity::GetEntity(bCString("PC_Hero"));
-            if (Body == None || Body == a_Attacker || !Body.IsNPC() || Body.IsDead())
-                return GEFalse;
-            a_Body = Body;
-            return GETrue;
-        }
+
     } // namespace
 
     // AssessHit(victim, damaging object): the reaction of a creature to a blow (OnDamage calls it directly, not only
@@ -5029,83 +2272,9 @@ namespace RequirementsCheck
     // transformed body (a demon, a wolf, ...) does not have. So a MELEE blow of the transformed hero on a creature of his
     // army is handed to the native script in the name of his human body PC_Hero: the engine then sees the standard hero.
     // A blow of an outsider on a member of the army calls the pack only when it was purposeful (see below).
-    ME_DEFINE_AND_HOOK_SCRIPT(AssessHit)
+        ME_DEFINE_AND_HOOK_SCRIPT(AssessHit)
     {
-        Entity Victim = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-        Entity Source = ResolveEntity(a_pOtherEntity, a_pSPU->GetOtherEntity());
-        Entity Attacker = GetDamageOwnerNpc(Source);
-        if (Attacker == None && Victim != None && Victim.IsNPC())
-            Attacker = Victim.NPC.GetCurrentAttacker(); // OnDamage may pass no damaging object
-        GEInt iResult = 0;
-        // THE FRIENDLY-FIRE FILTER ON THE REACTION TOO: OnDamage calls AssessHit directly (not only through DoLogicalDamage),
-        // so a blocked blow (a transformed hero, a sword, an arrow, an area spell) must not stagger the creature, open the
-        // brawl or be counted as a blow of the manual counter. Only a point magic projectile of the human form goes on.
-        if (Victim != None && Attacker != None && Victim.IsNPC() && IsHeroSide(Attacker) && IsHeroControlled(Victim) &&
-            IsFriendlyFire(Attacker, Victim, GEFalse, &Source))
-        {
-            ZeroPendingDamage(Victim);
-            return 0;
-        }
-        Entity Body;
-        if (Victim != None && Victim.IsNPC() && Source != None && Source == Attacker && IsHeroControlled(Victim) &&
-            FindHumanBodyFor(Attacker, Body))
-        {
-            static GEInt s_iLines = 0;
-            if (s_iLines < 40)
-            {
-                ++s_iLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] AssessHit: the blow of '%s' (%p) on '%s' is judged by the "
-                                             "engine in the name of '%s' (distance between the bodies %.0f).\n",
-                                             Attacker.GetName().GetText(), static_cast<void *>(Attacker.GetInstance()),
-                                             Victim.GetName().GetText(), Body.GetName().GetText(),
-                                             static_cast<double>(Attacker.GetDistanceTo(Body)));
-            }
-            Entity BodyArg = Body;
-            iResult = AssessHit_Original(a_pSPU, a_pSelfEntity, &BodyArg, a_iArgs);
-        }
-        else
-            iResult = AssessHit_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
-        // v1.0.35.0: AssessHit is where the native code knocks the victim out (ZS_Unconscious): a green resident who falls
-        // here at the hands of the hero is the second blow at once (no 10 s window).
-        if (Victim != None && Attacker != None && Victim.IsNPC() && IsHeroSide(Attacker) && !IsHeroControlled(Victim))
-            OnCityKnockout(Victim, "AssessHit");
-        // A blow of the hero (any form) on a creature of his army: the engine has just judged it natively. In his direct
-        // focus the blow opens the native brawl (the first blow is borne, the second one starts the fight, handled in the
-        // name of PC_Hero); outside the focus it is a chance blow and nothing is opened. The rest of the army stays out of it.
-        if (Victim != None && Attacker != None && Victim.IsNPC() && IsHeroSide(Attacker) && IsHeroControlled(Victim))
-        {
-            GEBool const bFocus = GETrue; // v1.0.28.0: every blow of the hero that came through opens the native brawl
-            if (bFocus)
-                RecordCombat(Victim, Attacker);
-            static GEInt s_iBrawlLines = 0;
-            if (s_iBrawlLines < 60)
-            {
-                ++s_iBrawlLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] AssessHit: the hero ('%s') hit '%s' (party type %d), "
-                                             "damage passed=%d -> %s (task '%s', result %d)\n",
-                                             Attacker.GetName().GetText(), Victim.GetName().GetText(),
-                                             static_cast<int>(Victim.Party.PartyMemberType), static_cast<int>(bFocus),
-                                             bFocus ? "native brawl reaction allowed" : "nothing opened",
-                                             Victim.Routine.GetCurrentTask().GetText(), static_cast<int>(iResult));
-            }
-        }
-        if (Victim != None && Attacker != None && Victim.IsNPC() && !Victim.IsDead() && IsHeroControlled(Victim) &&
-            !IsHeroSide(Attacker) && !IsHeroControlled(Attacker))
-        {
-            // An OUTSIDER (an orc, a monster, a bandit) hit a member of the army: v1.0.27.0 - nothing of the plugin is
-            // applied to it. The engine alone judges the blow (ZS_Stumble, the answer of the victim and of the others).
-            static GEInt s_iOutsiderLines = 0;
-            if (s_iOutsiderLines < 60)
-            {
-                ++s_iOutsiderLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] AssessHit: the outsider '%s' hit '%s' (party type %d): "
-                                             "native reaction, the plugin does not interfere (task '%s').\n",
-                                             Attacker.GetName().GetText(), Victim.GetName().GetText(),
-                                             static_cast<int>(Victim.Party.PartyMemberType),
-                                             Victim.Routine.GetCurrentTask().GetText());
-            }
-        }
-        return iResult;
+        return PluginRuntime::Combat::AssessHit(AssessHit_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
     }
 
     // AssessAgressor(victim, attacker): called by every stumble state after a blow. THE NATIVE RULE (disassembly, 1.8.7): for
@@ -5116,73 +2285,17 @@ namespace RequirementsCheck
     //  - first blow  -> ZS_ReactToDamage against the hero (the native answer of the party is NOT run);
     //  - second blow -> the native answer (the fight; the brawl slot is open since OnHeroBlowOnArmy);
     //  - the hero is knocked out -> nothing is run, the creature goes back to the routine of following.
-    ME_DEFINE_AND_HOOK_SCRIPT(AssessAgressor)
+        ME_DEFINE_AND_HOOK_SCRIPT(AssessAgressor)
     {
-        Entity Self = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-        Entity Other = ResolveEntity(a_pOtherEntity, a_pSPU->GetOtherEntity());
-        if (Self != None && Other != None && Self.IsNPC() && !Self.IsDead() && IsHeroControlled(Self) && IsHeroSide(Other))
-        {
-            if (IsHeroKnockedOut())
-            {
-                StandDownFromMaster(Self, "AssessAgressor");
-                return 1;
-            }
-            GEInt const iSlot = FindBrawlSlot(Self.GetName(), GEFalse);
-            GEBool const bFight = iSlot >= 0 && g_arrBrawlStart[iSlot] != 0;
-            if (!bFight)
-            {
-                // THE FIRST BLOW: the reaction of a green NPC, not the fight.
-                Entity Hero = Entity::GetPlayer();
-                if (iSlot >= 0)
-                    g_arrBrawlReacted[iSlot] = GETrue;
-                Self.NPC.SetCurrentTarget(Hero);
-                Self.NPC.AttackReason = gEAttackReason_ReactToDamage;
-                Self.Routine.SetTask("ZS_ReactToDamage");
-                static GEInt s_iLines = 0;
-                if (s_iLines < 60)
-                {
-                    ++s_iLines;
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix] AssessAgressor: the first blow of the hero on '%s' (party "
-                                                 "type %d): ZS_ReactToDamage instead of the immediate attack.\n",
-                                                 Self.GetName().GetText(), static_cast<int>(Self.Party.PartyMemberType));
-                }
-                return 1;
-            }
-        }
-        GEInt const iAgressorResult = AssessAgressor_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
-        // v1.0.35.0: the stumble states call AssessAgressor after every blow, also the one that knocked the victim out.
-        if (Self != None && Other != None && Self.IsNPC() && IsHeroSide(Other) && !IsHeroControlled(Self))
-            OnCityKnockout(Self, "AssessAgressor");
-        return iAgressorResult;
+        return PluginRuntime::Combat::AssessAgressor(AssessAgressor_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
     }
 
     // ZS_Stumble: the native stumble of a creature that was hit. It takes its attacker from the creature itself
     // (GetCurrentAttacker) and the stumble animation is made relative to him. When the attacker is the transformed hero,
     // the engine gets his human body PC_Hero for the time of the call, exactly as for the standard hero.
-    ME_DEFINE_AND_REPLACE_SCRIPT_AI_STATE(ZS_Stumble)
+        ME_DEFINE_AND_REPLACE_SCRIPT_AI_STATE(ZS_Stumble)
     {
-        Entity Self(a_pSPU->GetSelfEntity());
-        if (Self != None && Self.IsNPC() && IsHeroControlled(Self))
-        {
-            Entity Attacker = Self.NPC.GetCurrentAttacker();
-            Entity Body;
-            if (FindHumanBodyFor(Attacker, Body))
-            {
-                static GEInt s_iLines = 0;
-                if (s_iLines < 40)
-                {
-                    ++s_iLines;
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix] ZS_Stumble: '%s' stumbles from '%s' as from '%s'.\n",
-                                                 Self.GetName().GetText(), Attacker.GetName().GetText(),
-                                                 Body.GetName().GetText());
-                }
-                Self.NPC.SetCurrentAttacker(Body);
-                GEBool const bResult = ZS_Stumble_Original(a_rRunTimeStack, a_pSPU);
-                Self.NPC.SetCurrentAttacker(Attacker);
-                return bResult;
-            }
-        }
-        return ZS_Stumble_Original(a_rRunTimeStack, a_pSPU);
+        return GroupLogic::Lifecycle::ZS_Stumble(ZS_Stumble_Original, a_rRunTimeStack, a_pSPU);
     }
 
     // NO LOOTING AND NO FINISHING OF THE MASTER. When the hero is down, a creature of his own party (types 1..5) does
@@ -5190,106 +2303,36 @@ namespace RequirementsCheck
     // (see the hooks below), and the two routines themselves are left at once if they were started anyway.
     namespace
     {
-        GEBool IsMasterDownVictim(Entity &a_Self, Entity &a_Other)
-        {
-            return a_Self != None && a_Other != None && a_Self.IsNPC() && IsHeroControlled(a_Self) && IsHeroSide(a_Other);
-        }
 
-        GEBool LeaveMasterAlone(gCScriptProcessingUnit *a_pSPU, GELPCChar a_strWhat)
-        {
-            Entity Self(a_pSPU->GetSelfEntity());
-            if (Self == None || !Self.IsNPC())
-                return GEFalse;
-            Entity Target(a_pSPU->GetTargetEntity());
-            Entity Current = Self.NPC.GetCurrentTarget();
-            if (!IsMasterDownVictim(Self, Target) && !IsMasterDownVictim(Self, Current))
-                return GEFalse;
-            static GEInt s_iLines = 0;
-            if (s_iLines < 40)
-            {
-                ++s_iLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] %s: '%s' (party type %d) does not touch his master.\n",
-                                             a_strWhat, Self.GetName().GetText(),
-                                             static_cast<int>(Self.Party.PartyMemberType));
-            }
-            Self.Routine.FullStop();
-            Self.NPC.SetCurrentTarget(None);
-            Self.NPC.AttackReason = gEAttackReason_None;
-            Self.Routine.ContinueRoutine();
-            return GETrue;
-        }
+
     } // namespace
 
-    ME_DEFINE_AND_REPLACE_SCRIPT_AI_STATE(ZS_RansackBody)
+        ME_DEFINE_AND_REPLACE_SCRIPT_AI_STATE(ZS_RansackBody)
     {
-        if (LeaveMasterAlone(a_pSPU, "ZS_RansackBody"))
-            return GETrue;
-        return ZS_RansackBody_Original(a_rRunTimeStack, a_pSPU);
+        return GroupLogic::Lifecycle::ZS_RansackBody(ZS_RansackBody_Original, a_rRunTimeStack, a_pSPU);
     }
 
-    ME_DEFINE_AND_REPLACE_SCRIPT_AI_STATE(ZS_Attack_FinishingAttack)
+        ME_DEFINE_AND_REPLACE_SCRIPT_AI_STATE(ZS_Attack_FinishingAttack)
     {
-        if (LeaveMasterAlone(a_pSPU, "ZS_Attack_FinishingAttack"))
-            return GETrue;
-        return ZS_Attack_FinishingAttack_Original(a_rRunTimeStack, a_pSPU);
+        return GroupLogic::Lifecycle::ZS_Attack_FinishingAttack(ZS_Attack_FinishingAttack_Original, a_rRunTimeStack, a_pSPU);
     }
     // AssessDefeat(self, other): the perception of a defeated fighter (it starts the looting / finishing reaction).
     // A creature of the party does not take its own fallen master for a victim.
-    ME_DEFINE_AND_HOOK_SCRIPT(AssessDefeat)
+        ME_DEFINE_AND_HOOK_SCRIPT(AssessDefeat)
     {
-        Entity Self = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-        Entity Other = ResolveEntity(a_pOtherEntity, a_pSPU->GetOtherEntity());
-        if (IsMasterDownVictim(Self, Other))
-        {
-            static GEInt s_iLines = 0;
-            if (s_iLines < 40)
-            {
-                ++s_iLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] AssessDefeat: '%s' (party type %d) ignores the fall of his master.\n",
-                                             Self.GetName().GetText(), static_cast<int>(Self.Party.PartyMemberType));
-            }
-            return 0;
-        }
-        return AssessDefeat_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
+        return PluginRuntime::Combat::AssessDefeat(AssessDefeat_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
     }
 
-    ME_DEFINE_AND_HOOK_SCRIPT(IsDeadlyDamage)
+        ME_DEFINE_AND_HOOK_SCRIPT(AssessTalk)
     {
-        GEInt const iResult = IsDeadlyDamage_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
-        if (!iResult)
-            return iResult;
-        Entity Victim = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-        Entity Source = ResolveEntity(a_pOtherEntity, a_pSPU->GetOtherEntity());
-        Entity Attacker = GetDamageOwnerNpc(Source);
-        // v1.0.57.0: THE IRON IMMUNITY: no blow (a one-hand thrust, a stab, a control effect) is deadly for the hero who is down or
-        // only rising - whoever deals it and whatever the mercy says.
-        if (Victim != None && Victim == Entity::GetPlayer() && UpdateHeroImmunity())
-        {
-            static GEInt s_iImmuneLines = 0;
-            if (s_iImmuneLines < 40)
-            {
-                ++s_iImmuneLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] IsDeadlyDamage: the blow of '%s' on the hero who is down / rising is "
-                                             "not deadly.\n",
-                                             Attacker != None ? Attacker.GetName().GetText() : "-");
-            }
-            return 0;
-        }
-        // A creature of the party never kills the hero (a brawl inside the party ends with a knock-out, not with death).
-        // FollowerMustSpare leaves the hero out on purpose, and a non-humanoid creature (a skeleton) is deadly natively.
-        if (Attacker != None && Victim != None && IsHeroSide(Victim) && IsHeroControlled(Attacker))
-        {
-            static GEInt s_iLines = 0;
-            if (s_iLines < 40)
-            {
-                ++s_iLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] IsDeadlyDamage: the blow of '%s' (party type %d) on his master "
-                                             "is not deadly.\n",
-                                             Attacker.GetName().GetText(), static_cast<int>(Attacker.Party.PartyMemberType));
-            }
-            return 0;
-        }
-        return FollowerMustSpare(Attacker, Victim, "IsDeadlyDamage") ? 0 : iResult;
+        return GroupLogic::Lifecycle::AssessTalk(AssessTalk_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
+    }
+
+    
+
+        ME_DEFINE_AND_HOOK_SCRIPT(IsDeadlyDamage)
+    {
+        return PluginRuntime::Combat::IsDeadlyDamage(IsDeadlyDamage_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
     }
 
     // The "human view" mirror of the beast form (clearing the transformed bit of the hero around GetAttitudeToPlayer) was
@@ -5306,35 +2349,9 @@ namespace RequirementsCheck
     //  2. Primary aggression of the faction None (wild animals, slaves, neutrals) against a summon of the hero (party
     //     type 5) is not allowed: Neutral until the summon hurts the NPC first.
     //
-    ME_DEFINE_AND_HOOK_SCRIPT(GetAttitudeToPlayer)
+        ME_DEFINE_AND_HOOK_SCRIPT(GetAttitudeToPlayer)
     {
-        GEInt const iResult = GetAttitudeToPlayer_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
-        if (iResult != gEAttitude_Angry && iResult != gEAttitude_Hostile && iResult != gEAttitude_Predator &&
-            iResult != gEAttitude_Panic)
-            return iResult;
-        Entity Self = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-        if (Self == None || !Self.IsNPC())
-            return iResult;
-        if (IsHeroControlled(Self) && !IsBrawlFighting(Self))
-            return gEAttitude_Friendly;
-        // v1.0.36.0: the target of this query is the player (the entity of the form while the hero is transformed).
-        {
-            Entity PlayerTarget = Entity::GetPlayer();
-            if (IsWandererImmune(Self, PlayerTarget))
-            {
-                LogPoliticalFilter("GetAttitudeToPlayer", "a Wanderer sees a human in the beast form", Self, PlayerTarget);
-                return gEAttitude_Neutral;
-            }
-            if (IsSlaveVsNoneBlocked(Self, PlayerTarget))
-            {
-                LogPoliticalFilter("GetAttitudeToPlayer", "faction None vs a Slave target (form)", Self, PlayerTarget);
-                return gEAttitude_Neutral;
-            }
-        }
-        Entity Other = ResolveEntity(a_pOtherEntity, a_pSPU->GetOtherEntity());
-        if (Other != None && IsPrimaryAggressionOnSummon(Self, Other))
-            return gEAttitude_Neutral;
-        return iResult;
+        return PluginRuntime::Combat::GetAttitudeToPlayer(GetAttitudeToPlayer_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
     }
 
     // GetAttitude(self, other): who is friend / enemy of whom.
@@ -5342,86 +2359,16 @@ namespace RequirementsCheck
     //    native answer was aggressive - the name of a companion stays blue).
     //  - A creature of the army takes an enemy who attacks one of the army (see DefendAlly) for Hostile.
     //  - Faction None never takes a summon of the hero for an enemy before the summon hurts it first.
-    ME_DEFINE_AND_HOOK_SCRIPT(GetAttitude)
+        ME_DEFINE_AND_HOOK_SCRIPT(GetAttitude)
     {
-        PollFleeWatch(); // diagnostics only
-        GEInt const iResult = GetAttitude_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
-        Entity Self = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-        Entity Other = ResolveEntity(a_pOtherEntity, a_pSPU->GetOtherEntity());
-        if (Self == None || Other == None || !Self.IsNPC() || Self == Other)
-            return iResult;
-        GEBool const bAggressive = iResult == gEAttitude_Angry || iResult == gEAttitude_Hostile ||
-                                   iResult == gEAttitude_Predator;
-        // v1.0.36.0: rule 6 (the Wanderers do not take the hero in a beast form for an enemy) and rule 5 (faction None vs a
-        // Slave target). Only an aggressive native answer is replaced, by Neutral.
-        // v1.0.38.0: the Wanderers (gEPoliticalAlignment_Mid) also never PANIC at the hero in a form.
-        if ((bAggressive || iResult == gEAttitude_Panic) && IsWandererImmune(Self, Other))
-        {
-            LogPoliticalFilter("GetAttitude", "a Wanderer (Mid) sees a human in the beast form", Self, Other);
-            return gEAttitude_Neutral;
-        }
-        if (bAggressive)
-        {
-            if (IsSlaveVsNoneBlocked(Self, Other))
-            {
-                LogPoliticalFilter("GetAttitude", "faction None vs a Slave target (form / party creature)", Self, Other);
-                return gEAttitude_Neutral;
-            }
-        }
-        // The fight has started: an outsider is in a real fight with the hero / the army (he hit one of them, or one of them
-        // hit him) - the plugin touches nothing, the native attitude and the native answer of the squad decide.
-        if (!IsDuelTaboo(Other) && !IsDuelTaboo(Self) && IsInRealFight(Self, Other))
-            return iResult;
-        if (!IsHeroControlled(Self))
-        {
-            if (!bAggressive || (!IsPrimaryAggressionOnSummon(Self, Other) && !(IsHeroControlled(Other) && IsDuelTaboo(Self))))
-                return iResult;
-            static GEInt s_iLines = 0;
-            if (s_iLines < 40)
-            {
-                ++s_iLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] GetAttitude: '%s' (no faction) ignores the summon '%s' of "
-                                             "the hero until it hurts him first (was %d).\n",
-                                             Self.GetName().GetText(), Other.GetName().GetText(),
-                                             static_cast<int>(iResult));
-            }
-            return gEAttitude_Neutral;
-        }
-        Entity Hero = Entity::GetPlayer();
-        GEBool const bOtherIsHero = Other == Hero || IsHeroFormEntity(Other);
-        if (bAggressive && IsDuelTaboo(Other))
-            return gEAttitude_Neutral; // the opponent of the duel is invisible for the army
-        if (bOtherIsHero && IsBrawlFighting(Self))
-            return iResult; // the second blow opened the brawl: the native attitude to the hero is not overridden
-        if (!bOtherIsHero && !IsHeroControlled(Other) && IsDefendedTarget(Other.GetName()))
-            return gEAttitude_Hostile; // somebody attacks a member of the army: the army sees an enemy in him
-        if (iResult == gEAttitude_Friendly)
-            return iResult;
-        if (bOtherIsHero || IsHeroControlled(Other))
-        {
-            static GEInt s_iLines = 0;
-            if (s_iLines < 40)
-            {
-                ++s_iLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] GetAttitude: '%s' (controlled by the hero) stays friendly "
-                                             "to '%s' (was %d).\n",
-                                             Self.GetName().GetText(), Other.GetName().GetText(),
-                                             static_cast<int>(iResult));
-            }
-            return gEAttitude_Friendly;
-        }
-        return iResult;
+        return PluginRuntime::Combat::GetAttitude(GetAttitude_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
     }
 
     // The colour of the name under the cursor. A creature of the army is blue (Friendly) in any form of the hero: the
     // native script compares the party leader with the player, which is the transformed body, not PC_Hero.
-    ME_DEFINE_AND_HOOK_SCRIPT(GetFocusNameAttitude)
+        ME_DEFINE_AND_HOOK_SCRIPT(GetFocusNameAttitude)
     {
-        GEInt const iResult = GetFocusNameAttitude_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
-        Entity Self = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-        if (Self != None && Self.IsNPC() && IsHeroControlled(Self))
-            return gEAttitude_Friendly;
-        return iResult;
+        return PluginRuntime::Combat::GetFocusNameAttitude(GetFocusNameAttitude_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
     }
 
     //
@@ -5435,49 +2382,13 @@ namespace RequirementsCheck
     //
     namespace
     {
-        GEBool IsCityBrawlVictimAlive()
-        {
-            if (g_strCityVictim.IsEmpty())
-                return GEFalse;
-            bTObjArray<Entity> arrNPCs = Entity::GetNPCs();
-            for (GEInt i = 0; i < arrNPCs.GetCount(); ++i)
-            {
-                Entity Npc = arrNPCs.GetAt(i);
-                if (Npc.GetName() == g_strCityVictim)
-                    return Npc.IsDead() ? GEFalse : GETrue;
-            }
-            return GEFalse; // unknown: nothing is changed
-        }
+
+
     } // namespace
 
-    ME_DEFINE_AND_HOOK_SCRIPT(StartSayAttackReason)
+        ME_DEFINE_AND_HOOK_SCRIPT(StartSayAttackReason)
     {
-        Entity Self = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-        gEAttackReason enuOriginal = gEAttackReason_None;
-        GEBool bSwapped = GEFalse;
-        if (g_enuCityPhase == mECityPhase_Aggro && Self != None && Self.IsNPC() && !(Self == Entity::GetPlayer()))
-        {
-            enuOriginal = Self.NPC.AttackReason;
-            if ((enuOriginal == gEAttackReason_Murder || enuOriginal == gEAttackReason_Enemy) &&
-                FindAggro(Self.GetName()) >= 0 && IsCityBrawlVictimAlive())
-            {
-                Self.NPC.AttackReason = gEAttackReason_StopFight;
-                bSwapped = GETrue;
-                static GEInt s_iLines = 0;
-                if (s_iLines < 40)
-                {
-                    ++s_iLines;
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix] '%s' shouts about the brawl, not about a murder (attack "
-                                                 "reason %d -> %d for the voice line); nobody died.\n",
-                                                 Self.GetName().GetText(), static_cast<int>(enuOriginal),
-                                                 static_cast<int>(gEAttackReason_StopFight));
-                }
-            }
-        }
-        GEInt const iResult = StartSayAttackReason_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
-        if (bSwapped)
-            Self.NPC.AttackReason = enuOriginal;
-        return iResult;
+        return SocialLogic::Hooks::StartSayAttackReason(StartSayAttackReason_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
     }
 
     GLF_SUMMON_HOOK(MagicSummon)
@@ -5558,7 +2469,7 @@ namespace RequirementsCheck
             GEU8 *pPush = pBase + 0x208A7;
             if (pPush[0] != 0x68)
             {
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] ZS_ReactToDamage: the code differs (opcode %02X): the line of the "
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] ZS_ReactToDamage: the code differs (opcode %02X): the line of the "
                                              "stance is left as it is.\n",
                                              pPush[0]);
                 return;
@@ -5568,14 +2479,14 @@ namespace RequirementsCheck
             GEU8 const *pEnd = pBase + 0x139000; // the image of the module (SizeOfImage 0x139000)
             if (pString < pBase || pString + 16 > pEnd || strcmp(reinterpret_cast<char const *>(pString), "WhatAreYouDoing") != 0)
             {
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] ZS_ReactToDamage: the operand does not point at \"WhatAreYouDoing\": "
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] ZS_ReactToDamage: the operand does not point at \"WhatAreYouDoing\": "
                                              "the line of the stance is left as it is.\n");
                 return;
             }
             DWORD dwOld = 0;
             if (!::VirtualProtect(pPush + 1, 4, PAGE_EXECUTE_READWRITE, &dwOld))
             {
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] ZS_ReactToDamage: cannot unlock the code for the line patch.\n");
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] ZS_ReactToDamage: cannot unlock the code for the line patch.\n");
                 return;
             }
             *reinterpret_cast<GEU8 const **>(pPush + 1) = reinterpret_cast<GEU8 const *>(g_arrReactSvm);
@@ -5583,7 +2494,7 @@ namespace RequirementsCheck
             ::VirtualProtect(pPush + 1, 4, dwOld, &dwDummy);
             ::FlushInstructionCache(::GetCurrentProcess(), pPush + 1, 4);
             g_bReactSvmPatched = GETrue;
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] ZS_ReactToDamage: the line of the stance is replaceable (patched).\n");
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix] ZS_ReactToDamage: the line of the stance is replaceable (patched).\n");
         }
 
         void ResetMagicJudge()
@@ -5646,7 +2557,7 @@ namespace RequirementsCheck
                 Opponent = *a_pHint;
             else if (!FindArenaOpponent(Opponent) && !FindRememberedOpponent(Opponent))
             {
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Arena, stage 1: the hero is in the magic mode, but the "
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Arena, stage 1: the hero is in the magic mode, but the "
                                              "opponent is not found.\n");
                 return;
             }
@@ -5672,7 +2583,7 @@ namespace RequirementsCheck
             // The code of the game could not be patched: the shout is made by hand (the native "WhatAreYouDoing" cannot be removed).
             if (!g_bReactSvmPatched)
                 ::StartSaySVM(Opponent, Hero, bCString(strSvm), 9);
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Arena, stage 1: the hero holds a forbidden weapon (%s) - the opponent '%s' "
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Arena, stage 1: the hero holds a forbidden weapon (%s) - the opponent '%s' "
                                          "takes the stance of the first blow (ZS_ReactToDamage) and warns him (%s); "
                                          "%u ms to put the weapon away.\n",
                                          g_bWarnRanged ? "bow / crossbow" : "magic", Opponent.GetName().GetText(), strSvm,
@@ -5724,7 +2635,7 @@ namespace RequirementsCheck
             // v1.0.61.0: the line is "Good" ("Хорошо!"), NOT "WiseMove" (that one is voiced as an aggressive "come here").
             if (a_bApprove)
                 SayArenaLine(Opponent, Hero, ARENA_APPROVE_SVM, 9, "the forbidden weapon is put away");
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Arena: the forbidden weapon is put away - the opponent '%s' %sgoes back "
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Arena: the forbidden weapon is put away - the opponent '%s' %sgoes back "
                                          "to the duel.\n",
                                          Opponent.GetName().GetText(), a_bApprove ? "approves (Good) and " : "");
         }
@@ -5927,7 +2838,7 @@ namespace RequirementsCheck
             GEBool const bOpponent = FindDuelOpponentAnywhere(Opponent);
             ResetMagicJudge(); // the warning stance (if any) is dropped WITHOUT sending the opponent back into the fight
             g_bTransformReset = GETrue;
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Arena, transformation (%s): the duel is cancelled (%s), the quest is open "
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Arena, transformation (%s): the duel is cancelled (%s), the quest is open "
                                          "for a new start.\n",
                                          a_strWhy, bInRing ? "the hero is in the ring: a crime" : "the hero is before the ring");
             // The crime FIRST: the search of the opponent inside needs his attack reason, which the end of the fight changes.
@@ -5968,7 +2879,7 @@ namespace RequirementsCheck
             // v1.0.67.0: IN THE RING (the crime is declared, the mercy is armed) the opponent does NOT leave: he and the crowd of the camp
             // fight the form exactly as they fought the man (BeginFormAggro: when the body of the form appears each of them gets ONE order
             // against it). Before the ring there is no crime and no fight: the opponent leaves as before.
-            if (bInRing && g_bSpareArmed)
+            if (bInRing && IsArmed())
                 BeginFormAggro(Opponent, bOpponent);
             else if (bOpponent)
                 EndArenaFightOfOpponent(Opponent); // ZS_Attack_Arena_End: the opponent is calm again
@@ -6008,6 +2919,52 @@ namespace RequirementsCheck
             }
         }
 
+        void CancelAbandonedArena(GELPCChar why, GEBool keepWaiting)
+        {
+            static GEBool busy = GEFalse;
+            if (busy || !HasRunningArenaQuest()) return;
+            busy = GETrue;
+            Entity opponent;
+            GEBool const found = FindDuelOpponentAnywhere(opponent) || FindArenaOpponent(opponent) || FindRememberedOpponent(opponent);
+            StoreEntryPending(GEFalse);
+            ResetMagicJudge();
+            if (keepWaiting)
+            {
+                // Convert only the session's automatic wait into ordinary AUTO waiting.
+                // Clearing the arena list prevents the quest-end edge from releasing them.
+                for (GEInt i = 0; i < g_iWaiterCount; ++i)
+                {
+                    Entity npc = Entity::GetEntity(g_arrWaiters[i]);
+                    if (npc != None && npc.IsNPC() && !npc.IsDead() && npc.Party.Waiting &&
+                        GetWaiterType(npc) != mEWaiterType_User)
+                        MarkWaiterAuto(npc);
+                }
+                for (GEInt i = 0; i < WAITER_MAX; ++i) g_arrWaiters[i] = bCString();
+                g_iWaiterCount = 0;
+                g_bArenaReleasePending = GEFalse;
+            }
+            EndArenaSession(why, GETrue, keepWaiting ? 0 : 2);
+            gCQuestManager_PS *manager = gCQuestManager_PS::GetInstance();
+            if (manager)
+            {
+                bTObjArray<bTAutoPOSmartPtr<gCQuest_PS>> const &quests = manager->GetQuests();
+                for (GEInt i = 0; i < quests.GetCount(); ++i)
+                {
+                    gCQuest_PS *quest = const_cast<gCQuest_PS *>(static_cast<gCQuest_PS const *>(quests.GetAt(i)));
+                    if (quest && quest->GetType() == gEQuestType_Arena && quest->GetStatus() == gEQuestStatus_Running)
+                    {
+                        gEQuestStatus const lost = gEQuestStatus_Lost;
+                        quest->SetStatus(lost);
+                    }
+                }
+            }
+            if (found && opponent != None && opponent.IsNPC() && !opponent.IsDead() && !opponent.IsDown())
+                EndArenaFightOfOpponent(opponent);
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix][arena-entry] fight cancelled: %s; opponent='%s'.\n",
+                why, found ? opponent.GetName().GetText() : "-");
+            busy = GEFalse;
+        }
+
         // v1.0.58.0: STAGE 2 of the forbidden weapon: the LOCAL CRIME (Mercy armed, every witness around the ring attacks the hero)
         // and the duel quest is closed (Lost); the opponent ends the fight (ZS_Attack_Arena_End). Once per quest (g_bMagicPunished).
         // v1.0.61.0: the opponent does NOT leave the ring in stage 2: he is held in the attack on the hero together with the crowd of the
@@ -6029,7 +2986,7 @@ namespace RequirementsCheck
 
             Entity Opponent;
             GEBool const bOpponent = FindDuelOpponentAnywhere(Opponent);
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Arena, stage 2: %s - the crime is declared, the duel quest is closed.\n",
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Arena, stage 2: %s - the crime is declared, the duel quest is closed.\n",
                                          a_strWhy);
             // The crime FIRST: the search of the opponent inside needs his attack reason, which the end of the fight changes.
             DeclareHeroCriminal(a_strCrime, GETrue);
@@ -6045,7 +3002,7 @@ namespace RequirementsCheck
                 ForceAttack(Opponent, Hero, gEAttackReason_Enemy);
                 g_strStage2Hold = Opponent.GetName();
                 g_u32Stage2HoldTick = ::GetTickCount() | 1;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Arena, stage 2: the opponent '%s' stays in the fight (ZS_Attack against the "
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Arena, stage 2: the opponent '%s' stays in the fight (ZS_Attack against the "
                                              "hero) until the hero falls.\n",
                                              Opponent.GetName().GetText());
             }
@@ -6059,64 +3016,7 @@ namespace RequirementsCheck
             EndArenaSession(a_strWhy, GETrue, 1); // v1.0.68.0: the session ends; the AUTO waiters come back when the hero may be released
         }
 
-        // v1.0.61.0: the hero fell (stage 2): the opponent stops the fight and goes away, and says the line over the hero that lies on the
-        // sand (the voice and the silence of a lying opponent are decided by ScheduleOverLine / SayArenaLine; no text on the screen).
-        void ReleaseStage2Hold(GELPCChar a_strWhy)
-        {
-            if (g_strStage2Hold.IsEmpty())
-                return;
-            bCString const strName = g_strStage2Hold;
-            g_strStage2Hold = bCString();
-            Entity Opponent = Entity::GetEntity(strName);
-            if (Opponent == None || !Opponent.IsNPC() || Opponent.IsDead())
-                return;
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Arena, stage 2: the hero is down (%s) - the opponent '%s' stops the fight "
-                                         "and leaves.\n",
-                                         a_strWhy, Opponent.GetName().GetText());
-            ScheduleOverLine(Opponent); // the plaque is blocked, the line is said when the hero lies; silent if he lies himself
-            if (!Opponent.IsDown())
-                EndArenaFightOfOpponent(Opponent);
-        }
 
-        // v1.0.61.0: keeps the opponent of stage 2 in the attack (the engine may take him out of ZS_Attack when the duel quest is closed:
-        // the log showed ZS_ReactToDamage_Loop). Called from the tick of every NPC; one flag read when idle, a technical throttle.
-        void PollStage2Hold()
-        {
-            if (g_strStage2Hold.IsEmpty())
-                return;
-            GEU32 const u32Now = ::GetTickCount();
-            if (g_u32Stage2HoldTick != 0 && static_cast<GEInt>(u32Now - g_u32Stage2HoldTick) < 400)
-                return;
-            g_u32Stage2HoldTick = u32Now | 1;
-            Entity Hero = Entity::GetPlayer();
-            if (Hero == None || !g_bSpareArmed)
-            {
-                g_strStage2Hold = bCString(); // the mercy is over: nobody holds him
-                return;
-            }
-            if (IsHeroKnockedOut())
-            {
-                ReleaseStage2Hold("the knock-out is seen"); // the Defeat hook did not run for this fall
-                return;
-            }
-            Entity Opponent = Entity::GetEntity(g_strStage2Hold);
-            if (Opponent == None || !Opponent.IsNPC() || Opponent.IsDead() || Opponent.IsDown())
-            {
-                g_strStage2Hold = bCString();
-                return;
-            }
-            if (IsAttackingHero(Opponent, Hero))
-                return;
-            ForceAttack(Opponent, Hero, gEAttackReason_Enemy);
-            static GEInt s_iLines = 0;
-            if (s_iLines < 40)
-            {
-                ++s_iLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Arena, stage 2: the opponent '%s' is put back into the attack on the "
-                                             "hero (the engine took him out of it).\n",
-                                             Opponent.GetName().GetText());
-            }
-        }
 
         // v1.0.67.0: the transformation is cast in the ring: from now the plugin waits for the body of the form (an event seen by the
         // tick of an NPC) and then gives the crowd + the opponent one order against it (PollFormAggro).
@@ -6134,10 +3034,10 @@ namespace RequirementsCheck
             g_u32FormPendingSince = ::GetTickCount() | 1;
             g_u32FormPollTick = 0;
             g_strFormOpponent = a_bOpponent && a_Opponent != None ? a_Opponent.GetName() : bCString();
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Arena, transformation: the opponent '%s' and the crowd (%d) stay in the fight - "
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Arena, transformation: the opponent '%s' and the crowd (%d) stay in the fight - "
                                          "they are aimed at the body of the form when it appears.\n",
                                          g_strFormOpponent.IsEmpty() ? "-" : g_strFormOpponent.GetText(),
-                                         static_cast<int>(g_iAggroCount));
+                                         static_cast<int>(g_iArenaWitnessCount));
         }
 
         // v1.0.67.0: one NPC of the crowd / the opponent: does he need an order against the form now (and has he got the slot for it)?
@@ -6182,7 +3082,7 @@ namespace RequirementsCheck
                 return;
             g_u32FormPollTick = u32Now | 1;
             Entity Hero = Entity::GetPlayer();
-            if (Hero == None || !g_bSpareArmed)
+            if (Hero == None || !IsArmed())
             {
                 ResetFormAggro();
                 return;
@@ -6191,13 +3091,13 @@ namespace RequirementsCheck
             {
                 if (g_bFormSeen)
                 {
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix] Arena, transformation: the form is gone (the hero is a man again) - the "
+                    DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Arena, transformation: the form is gone (the hero is a man again) - the "
                                                  "pursuit of the form is over.\n");
                     ResetFormAggro();
                 }
                 else if (static_cast<GEInt>(u32Now - g_u32FormPendingSince) >= static_cast<GEInt>(FORM_WAIT_MS))
                 {
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix] Arena, transformation: no form appeared (the cast was interrupted).\n");
+                    DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Arena, transformation: no form appeared (the cast was interrupted).\n");
                     ResetFormAggro();
                 }
                 return;
@@ -6205,7 +3105,7 @@ namespace RequirementsCheck
             g_bFormSeen = GETrue;
             if (Hero.IsDead())
             {
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Arena, transformation: the body of the form is dead - the pursuit is over.\n");
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Arena, transformation: the body of the form is dead - the pursuit is over.\n");
                 ResetFormAggro();
                 return;
             }
@@ -6219,7 +3119,7 @@ namespace RequirementsCheck
                     continue;
                 bCString const strName = Npc.GetName();
                 GEBool const bOpponent = !g_strFormOpponent.IsEmpty() && g_strFormOpponent == strName;
-                if (!bOpponent && FindAggro(strName) < 0)
+                if (!bOpponent && !IsCurrentArenaWitness(Npc))
                     continue;
                 if (IsHeroSide(Npc) || IsHeroControlled(Npc))
                     continue;
@@ -6237,7 +3137,7 @@ namespace RequirementsCheck
             if (iOrdered > 0 && s_iLines < 40)
             {
                 ++s_iLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Arena, transformation: %d NPC(s) of the crowd / the opponent are ordered to "
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Arena, transformation: %d NPC(s) of the crowd / the opponent are ordered to "
                                              "attack the form '%s'.\n",
                                              static_cast<int>(iOrdered), Hero.GetName().GetText());
             }
@@ -6253,7 +3153,7 @@ namespace RequirementsCheck
             Entity Opponent;
             GEBool const bOpponent = FindDuelOpponentAnywhere(Opponent);
             ResetMagicJudge(); // the warning stance is dropped WITHOUT sending the opponent back into the fight; flags are clean
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Arena: %s - the duel is cancelled, the opponent leaves the ring.\n",
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Arena: %s - the duel is cancelled, the opponent leaves the ring.\n",
                                          a_strWhy);
             LogArenaQuests("cancelled, before");
             BlockArenaPlaque(); // v1.0.60.0: no text of the escape from the arena on the screen, only the voice
@@ -6318,391 +3218,12 @@ namespace RequirementsCheck
         // (party type 3)"), so the filter "strictly the type 1" found nobody. The permanent companions are the types 1..3
         // (Party, Mob, Slave): exactly the ones the native MagicTeleport puts to wait (WaitPlayerParty, type <= 3). The types
         // 4 and 5 are never moved.
-        GEInt const TELEPORT_FOLLOWERS_MAX = 16;
-        GEFloat const TELEPORT_FOLLOWER_MIN_DISTANCE = 300.0f; // beside the hero already: nothing to move (a failed cast)
-        GEFloat const TELEPORT_HERO_MIN_MOVE = 1000.0f;        // the hero really went somewhere (a stone, not a step)
-        GEU32 const TELEPORT_PENDING_MS = 4000;                // a technical limit of the late move below (not a game timing)
-        bCString g_arrTeleportFollowers[TELEPORT_FOLLOWERS_MAX];
-        GEInt g_iTeleportFollowers = 0;
-        bCVector g_vTeleportHeroBefore;
-        GEBool g_bTeleportPending = GEFalse; // the native script returned, the hero has not changed the place yet
-        GEU32 g_u32TeleportPendingTick = 0;
-        GEBool g_bTeleportScriptRuns = GEFalse; // inside the native MagicTeleport: the script WaitPlayerParty may be asked
-
-        // v1.0.50.0: the companion was collected for the move (the native script must not put him to wait nor print the plaque).
-        GEBool IsTeleportFollower(Entity &a_Npc)
-        {
-            if (a_Npc == None)
-                return GEFalse;
-            bCString const strName = a_Npc.GetName();
-            for (GEInt i = 0; i < g_iTeleportFollowers; ++i)
-                if (g_arrTeleportFollowers[i] == strName)
-                    return GETrue;
-            return GEFalse;
-        }
-
-        // The companion was NOT carried to the hero (the move failed / the hero did not leave the place): what the native script
-        // would have done is done now - he waits where he is, and the plaque "<name> is waiting" is shown.
-        void RestoreNativeWait(Entity &a_Npc)
-        {
-            a_Npc.Party.Waiting = GETrue;
-            a_Npc.Routine.FullStop();
-            a_Npc.Routine.SetTask("ZS_WaitForPlayer");
-            PrintCompanionWaitMessage(a_Npc);
-        }
-
-        GEFloat DistanceBetween(bCVector const &a_vFirst, bCVector const &a_vSecond)
-        {
-            GEFloat const fDx = a_vFirst.m_fX - a_vSecond.m_fX;
-            GEFloat const fDy = a_vFirst.m_fY - a_vSecond.m_fY;
-            GEFloat const fDz = a_vFirst.m_fZ - a_vSecond.m_fZ;
-            return std::sqrt(fDx * fDx + fDy * fDy + fDz * fDz);
-        }
-
-        // v1.0.68.0: ONE LINE PER COMPANION PER TELEPORT STONE: the name, the party type, the AI task, Waiting, the distance to the hero, the
-        // WaiterType and the exact reason why he was carried / skipped / stopped. The line goes to the plugin log and to the ring of the
-        // crash report (CrashDiag::Note), so a crash right after a stone shows who was doing what.
-        void LogTeleportRecord(GELPCChar a_strStage, Entity &a_Npc, Entity &a_Hero, GELPCChar a_strDecision, GELPCChar a_strReason)
-        {
-            bCString const strTask = a_Npc.Routine.GetCurrentTask();
-            gEPartyMemberType const enuType = a_Npc.Party.PartyMemberType;
-            char strLine[420] = {};
-            _snprintf_s(strLine, sizeof(strLine), _TRUNCATE,
-                        "[GenomeLogicFix][teleport] %s | '%s' | party type %d | task '%s' | Waiting=%d | distance %.0f | WaiterType=%s | %s: %s",
-                        a_strStage, a_Npc.GetName().GetText(), static_cast<int>(enuType), strTask.GetText() ? strTask.GetText() : "?",
-                        static_cast<int>(a_Npc.Party.Waiting ? 1 : 0),
-                        a_Hero != None ? static_cast<double>(a_Npc.GetDistanceTo(a_Hero)) : -1.0, WaiterTypeText(GetWaiterType(a_Npc)),
-                        a_strDecision, a_strReason);
-            GetDefaultLogger().LogFormat("%s\n", strLine);
-            CrashDiag::Note(strLine);
-        }
-
-        GEInt const TELEPORT_SEEN_MAX = 48;
-        bCString g_arrTeleportSeen[TELEPORT_SEEN_MAX];
-        GEInt g_iTeleportSeen = 0;
-
-        // v1.0.69.0: ONE candidate for the teleport. a_bPartyMember: he stands in the member list of the party of the hero - the very list the
-        // native script MagicTeleport walks through (WaitPlayerParty is run for every member of the types 1..3). Such a member is a
-        // companion even when the check "the leader of his own party is the hero" fails (IsHeroControlled): that was the reason why
-        // companions were put to wait and left behind - they were not collected, but the native script found them all the same.
-        // Every skip is written down, none is silent any more.
-        void ConsiderTeleportCandidate(Entity &Npc, Entity &Hero, GEBool a_bPartyMember)
-        {
-            if (Npc == None || Npc == Hero || !Npc.IsNPC())
-                return;
-            gEPartyMemberType const enuType = Npc.Party.PartyMemberType;
-            GEBool const bPermanent = enuType == gEPartyMemberType_Party || enuType == gEPartyMemberType_Mob ||
-                                      enuType == gEPartyMemberType_Slave;
-            GEBool const bControlled = IsHeroControlled(Npc);
-            if (!bControlled && !(a_bPartyMember && bPermanent))
-                return; // not a companion of the hero at all: not recorded
-            if (g_iTeleportFollowers >= TELEPORT_FOLLOWERS_MAX)
-            {
-                LogTeleportRecord("collect", Npc, Hero, "SKIPPED", "the list of the carried companions is full");
-                return;
-            }
-            if (Npc.IsDead())
-            {
-                LogTeleportRecord("collect", Npc, Hero, "SKIPPED", "he is dead");
-                return;
-            }
-            // v1.0.69.0: a companion who is knocked down is NOT dropped any more (before, he was skipped in silence here, the native script
-            // put him to wait, and he stayed behind). He is carried too; only his position is changed, his AI is left as it is.
-            {
-                // each companion is judged (and written down) once per stone, whichever list shows him first
-                bCString const strSeen = Npc.GetName();
-                for (GEInt i = 0; i < g_iTeleportSeen; ++i)
-                    if (g_arrTeleportSeen[i] == strSeen)
-                        return;
-                if (g_iTeleportSeen < TELEPORT_SEEN_MAX)
-                    g_arrTeleportSeen[g_iTeleportSeen++] = strSeen;
-            }
-            if (!bControlled)
-                LogTeleportRecord("collect", Npc, Hero, "NOTE",
-                                  "a member of the party of the hero, but the leader of his own party is NOT the hero: taken by the member list");
-            {
-                if (!bPermanent)
-                {
-                    LogTeleportRecord("collect", Npc, Hero, "SKIPPED", "party type 4 / 5 (a tamed / summoned creature): left to the native script");
-                    return;
-                }
-                // v1.0.51.0: THE BLACK LIST (IgnoreTeleportNames of the INI), checked FIRST, by the native name. Such a companion
-                // is never collected, so he is never carried: the native script WaitPlayerParty runs for him as in the pure game
-                // (he stays at the old place, "waits", the plaque is shown), whether he followed the hero or already waited.
-                if (IsTeleportNameIgnored(Npc.GetName().GetText()))
-                {
-                    LogTeleportRecord("collect", Npc, Hero, "SKIPPED", "the name is in IgnoreTeleportNames: stays and waits natively");
-                    return;
-                }
-                // v1.0.68.0: THE WAITER TYPE decides, the native flag Waiting alone does not. A wait that the PLAYER ordered (USER, or an
-                // old wait that no mark describes) is never broken: the companion stays. A wait that the plugin / the game ordered (AUTO:
-                // the start of an arena duel, a failed carry, a stone that put him to wait) is ignored: he is carried like a follower.
-                if (Npc.Party.Waiting)
-                {
-                    mEWaiterType const enuWait = GetWaiterType(Npc);
-                    if (enuWait != mEWaiterType_Auto)
-                    {
-                        LogTeleportRecord("collect", Npc, Hero, "SKIPPED",
-                                          enuWait == mEWaiterType_User ? "Waiting by the order of the PLAYER (USER): he stays"
-                                                                       : "Waiting with no mark (an older order of the player): he stays");
-                        return;
-                    }
-                    g_arrTeleportFollowers[g_iTeleportFollowers++] = Npc.GetName();
-                    LogTeleportRecord("collect", Npc, Hero, "CARRIED",
-                                      "Waiting by an AUTO order (the plugin / the game): the native flag is ignored, he is carried");
-                    return;
-                }
-                ClearWaiterMarks(Npc); // he follows: an old mark of a wait that is over is dropped
-                g_arrTeleportFollowers[g_iTeleportFollowers++] = Npc.GetName();
-                LogTeleportRecord("collect", Npc, Hero, "CARRIED", "follows the hero (Waiting=0)");
-            }
-        }
-
-        // BEFORE the native MagicTeleport: the companions (types 1..3) that follow the hero, and the place of the hero.
-        // v1.0.69.0: two sources. (1) every NPC of the world whose party leader is the hero (the old way); (2) the member list of the party
-        // of the hero - the list the native script itself walks. A companion that is in (2) but not in (1) was silently dropped before, put to
-        // wait by the native script and left behind (the log showed "native wait" with no "collect" line at all).
-        void CollectTeleportFollowers()
-        {
-            g_iTeleportFollowers = 0;
-            g_iTeleportSeen = 0;
-            g_bTeleportPending = GEFalse;
-            Entity Hero = Entity::GetPlayer();
-            g_vTeleportHeroBefore = Hero.GetPosition();
-            // v1.0.68.0: a teleport ends the arena session of the plugin: the hero is leaving the arena; whoever waited by the order of
-            // the session (AUTO) is carried below like any other AUTO waiter.
-            if (g_bArenaSessionHold)
-                EndArenaSession("a teleport", GEFalse, 0);
-            bTObjArray<Entity> arrNPCs = Entity::GetNPCs();
-            for (GEInt i = 0; i < arrNPCs.GetCount(); ++i)
-            {
-                Entity Npc = arrNPCs.GetAt(i);
-                ConsiderTeleportCandidate(Npc, Hero, GEFalse);
-            }
-            GEInt iMembers = 0;
-            {
-                bTValArray<eCEntity *> arrMembers = Hero.Party.GetMembers(GEFalse);
-                for (GEInt i = 0; i < arrMembers.GetCount(); ++i)
-                {
-                    eCEntity *pMember = arrMembers.GetAt(i);
-                    if (!pMember)
-                        continue;
-                    ++iMembers;
-                    Entity Member(static_cast<eCEntity const *>(pMember));
-                    ConsiderTeleportCandidate(Member, Hero, GETrue);
-                }
-            }
-            char strLine[240] = {};
-            _snprintf_s(strLine, sizeof(strLine), _TRUNCATE,
-                        "[GenomeLogicFix][teleport] stone: %d NPC(s) in the world, %d member(s) in the party of the hero, %d companion(s) carried",
-                        static_cast<int>(arrNPCs.GetCount()), static_cast<int>(iMembers), static_cast<int>(g_iTeleportFollowers));
-            GetDefaultLogger().LogFormat("%s\n", strLine);
-            CrashDiag::Note(strLine);
-        }
-
-        // v1.0.69.0: THE NET. The native script asks WaitPlayerParty for a member of the party that the collection did not take (for whatever
-        // reason). Instead of letting the script leave him behind waiting, he is collected NOW - the hero has not moved yet, so the carry
-        // after the cast takes him along. Never for a wait of the player, never for the black list, never for the types 4 / 5.
-        GEBool TryLateCollect(Entity &a_Member)
-        {
-            if (a_Member == None || !a_Member.IsNPC() || a_Member.IsDead() || g_iTeleportFollowers >= TELEPORT_FOLLOWERS_MAX)
-                return GEFalse;
-            gEPartyMemberType const enuType = a_Member.Party.PartyMemberType;
-            if (enuType != gEPartyMemberType_Party && enuType != gEPartyMemberType_Mob && enuType != gEPartyMemberType_Slave)
-                return GEFalse;
-            if (IsTeleportNameIgnored(a_Member.GetName().GetText()))
-                return GEFalse;
-            if (a_Member.Party.Waiting && GetWaiterType(a_Member) != mEWaiterType_Auto)
-                return GEFalse; // the player's wait stays
-            Entity Hero = Entity::GetPlayer();
-            g_arrTeleportFollowers[g_iTeleportFollowers++] = a_Member.GetName();
-            LogTeleportRecord("late collect", a_Member, Hero, "CARRIED",
-                              "the native script asked for him but the collection missed him: taken now, no wait, no plaque");
-            return GETrue;
-        }
-
-        // v1.0.68.0: THE SAFEGUARD AGAINST THE RUN ACROSS THE MAP. After a teleport a companion of the types 1..3 who is farther than
-        // FAR_COMPANION_DISTANCE from the hero (he stayed in another city) and whose wait is not the player's gets the order to stay where he
-        // is (FullStop + ZS_WaitForPlayer, AUTO, no plaque): the native follow would send him across the whole map. A USER wait is never
-        // touched. A companion who already waits (AUTO) is left as he is. The next teleport stone carries every AUTO waiter to the hero.
-        void SecureFarCompanions(GELPCChar a_strWhy)
-        {
-            Entity Hero = Entity::GetPlayer();
-            if (Hero == None)
-                return;
-            bTObjArray<Entity> arrNPCs = Entity::GetNPCs();
-            for (GEInt i = 0; i < arrNPCs.GetCount(); ++i)
-            {
-                Entity Npc = arrNPCs.GetAt(i);
-                if (Npc == None || Npc == Hero || !Npc.IsNPC() || Npc.IsDead() || !IsHeroControlled(Npc))
-                    continue;
-                gEPartyMemberType const enuType = Npc.Party.PartyMemberType;
-                if (enuType != gEPartyMemberType_Party && enuType != gEPartyMemberType_Mob && enuType != gEPartyMemberType_Slave)
-                    continue;
-                if (Npc.GetDistanceTo(Hero) <= FAR_COMPANION_DISTANCE)
-                    continue;
-                mEWaiterType const enuWait = GetWaiterType(Npc);
-                if (Npc.Party.Waiting)
-                {
-                    LogTeleportRecord(a_strWhy, Npc, Hero, "FAR, LEFT",
-                                      enuWait == mEWaiterType_Auto ? "already waits by an AUTO order: stays where he is, no run"
-                                                                   : "waits by the order of the player: never touched");
-                    continue;
-                }
-                Npc.Routine.FullStop();
-                Npc.Party.Waiting = GETrue;
-                Npc.Routine.SetTask("ZS_WaitForPlayer");
-                MarkWaiterAuto(Npc);
-                LogTeleportRecord(a_strWhy, Npc, Hero, "FAR, STOPPED",
-                                  "more than 10000 away and not carried: FullStop + wait (AUTO) so he does not run across the map");
-            }
-        }
-
-        // AFTER the native MagicTeleport: the hero stands at the new place; the collected companions are put to him by the info
-        // command MoveTo and go on following him.
-        void MoveTeleportFollowers(GELPCChar a_strWhy)
-        {
-            Entity Hero = Entity::GetPlayer();
-            GEInt iMoved = 0;
-            for (GEInt i = 0; i < g_iTeleportFollowers; ++i)
-            {
-                Entity Npc = Entity::GetEntity(g_arrTeleportFollowers[i]);
-                if (Hero == None)
-                    continue;
-                if (Npc == None || !Npc.IsNPC() || Npc.IsDead())
-                {
-                    char strGone[200] = {};
-                    _snprintf_s(strGone, sizeof(strGone), _TRUNCATE, "[GenomeLogicFix][teleport] moved | '%s' | SKIPPED: the entity is gone or dead",
-                                g_arrTeleportFollowers[i].GetText());
-                    GetDefaultLogger().LogFormat("%s\n", strGone);
-                    CrashDiag::Note(strGone);
-                    continue;
-                }
-                gEPartyMemberType const enuType = Npc.Party.PartyMemberType;
-                if (enuType == gEPartyMemberType_None || enuType == gEPartyMemberType_Controlled ||
-                    enuType == gEPartyMemberType_Summoned)
-                {
-                    LogTeleportRecord("moved", Npc, Hero, "SKIPPED", "left the party meanwhile, or is not a permanent companion");
-                    continue;
-                }
-                if (Npc.IsDown())
-                {
-                    // knocked down: only the place is changed, his AI (the knock-down task) is not touched
-                    GEFloat const fDownBefore = Npc.GetDistanceTo(Hero);
-                    if (fDownBefore > TELEPORT_FOLLOWER_MIN_DISTANCE)
-                    {
-                        Npc.MoveTo(Hero);
-                        if (Npc.GetDistanceTo(Hero) > TELEPORT_FOLLOWER_MIN_DISTANCE)
-                            Npc.Teleport(Hero);
-                        ++iMoved;
-                    }
-                    char strDown[220] = {};
-                    _snprintf_s(strDown, sizeof(strDown), _TRUNCATE,
-                                "[GenomeLogicFix][teleport] moved | '%s' | knocked down | distance %.0f -> %.0f | CARRIED: only the place is changed",
-                                Npc.GetName().GetText(), static_cast<double>(fDownBefore), static_cast<double>(Npc.GetDistanceTo(Hero)));
-                    GetDefaultLogger().LogFormat("%s\n", strDown);
-                    CrashDiag::Note(strDown);
-                    continue;
-                }
-                GEFloat const fBefore = Npc.GetDistanceTo(Hero);
-                GEBool bCarried = GETrue; // beside the hero already counts as carried
-                if (fBefore > TELEPORT_FOLLOWER_MIN_DISTANCE)
-                {
-                    Npc.MoveTo(Hero); // the info command "MoveTo": silent, instant
-                    GEFloat fAfter = Npc.GetDistanceTo(Hero);
-                    if (fAfter > TELEPORT_FOLLOWER_MIN_DISTANCE)
-                    {
-                        Npc.Teleport(Hero); // the second way of the game to put a character to another one
-                        fAfter = Npc.GetDistanceTo(Hero);
-                    }
-                    bCarried = fAfter <= TELEPORT_FOLLOWER_MIN_DISTANCE;
-                    if (bCarried)
-                        ++iMoved;
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix] Teleport (%s): the companion '%s' (party type %d) follows the "
-                                                 "hero: distance %.0f -> %.0f (%s).\n",
-                                                 a_strWhy, Npc.GetName().GetText(), static_cast<int>(enuType),
-                                                 static_cast<double>(fBefore), static_cast<double>(fAfter),
-                                                 bCarried ? "carried, no plaque" : "NOT carried, he waits");
-                }
-                if (bCarried)
-                {
-                    // The native script was not allowed to put him to wait (WaitPlayerParty is held back): he just goes on following
-                    // the hero, with no plaque on the screen.
-                    // v1.0.68.0: an AUTO waiter (the arena order, a failed carry) is carried too: the wait is over, no mark is left.
-                    ClearWaiterMarks(Npc);
-                    Npc.Party.Waiting = GEFalse;
-                    Npc.Routine.FullStop();
-                    Npc.Routine.SetTask("ZS_FollowPlayer");
-                    LogTeleportRecord("moved", Npc, Hero, "CARRIED", "he stands at the hero and follows him (ZS_FollowPlayer)");
-                }
-                else
-                {
-                    RestoreNativeWait(Npc); // not carried: the native behaviour and the plaque "<name> is waiting"
-                    MarkWaiterAuto(Npc);    // v1.0.68.0: this wait is the plugin's, not the player's: the next stone carries him
-                    LogTeleportRecord("moved", Npc, Hero, "NOT CARRIED", "the move failed: he waits where he is (AUTO), the next stone carries him");
-                }
-            }
-            if (iMoved == 0)
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Teleport (%s): nobody had to be moved.\n", a_strWhy);
-            SecureFarCompanions(a_strWhy);
-            g_iTeleportFollowers = 0;
-            g_bTeleportPending = GEFalse;
-            for (GEInt i = 0; i < TELEPORT_FOLLOWERS_MAX; ++i)
-                g_arrTeleportFollowers[i] = bCString();
-        }
-
-        // AFTER the native MagicTeleport script: when the hero is already at the new place the followers are moved at once; when
-        // his coordinates have not changed yet (the move can be finished by the engine a moment later), the followers stay
-        // collected and PollTeleportFollowers (every tick of every NPC) moves them in the frame the hero has moved.
-        void FinishTeleportFollowers(GELPCChar a_strWhy)
-        {
-            GEFloat const fMoved = DistanceBetween(Entity::GetPlayer().GetPosition(), g_vTeleportHeroBefore);
-            if (g_iTeleportFollowers == 0)
-            {
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Teleport (%s): nobody is carried (see the records above, one per companion).\n",
-                                             a_strWhy);
-                if (fMoved >= TELEPORT_HERO_MIN_MOVE)
-                    SecureFarCompanions(a_strWhy); // v1.0.68.0: nobody is carried, but a far companion must not run across the map
-                return;
-            }
-            if (fMoved >= TELEPORT_HERO_MIN_MOVE)
-            {
-                MoveTeleportFollowers(a_strWhy);
-                return;
-            }
-            g_bTeleportPending = GETrue;
-            g_u32TeleportPendingTick = ::GetTickCount() | 1;
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Teleport (%s): the hero has moved only %.0f so far - the companions wait "
-                                         "for his arrival.\n",
-                                         a_strWhy, static_cast<double>(fMoved));
-        }
-
-        void PollTeleportFollowers()
-        {
-            if (!g_bTeleportPending)
-                return;
-            if (static_cast<GEInt>(::GetTickCount() - g_u32TeleportPendingTick) > static_cast<GEInt>(TELEPORT_PENDING_MS))
-            {
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Teleport: the hero did not leave the place, the companions stay "
-                                             "and wait (the native plaque).\n");
-                g_bTeleportPending = GEFalse;
-                for (GEInt i = 0; i < g_iTeleportFollowers; ++i)
-                {
-                    Entity Npc = Entity::GetEntity(g_arrTeleportFollowers[i]);
-                    if (Npc != None && Npc.IsNPC() && !Npc.IsDead() && !Npc.IsDown())
-                    {
-                        RestoreNativeWait(Npc);
-                        MarkWaiterAuto(Npc); // v1.0.68.0: the plugin's wait, the next stone carries him
-                        Entity TimeoutHero = Entity::GetPlayer();
-                        LogTeleportRecord("timeout", Npc, TimeoutHero, "NOT CARRIED", "the hero did not leave the place: he waits (AUTO)");
-                    }
-                }
-                g_iTeleportFollowers = 0;
-                return;
-            }
-            if (DistanceBetween(Entity::GetPlayer().GetPosition(), g_vTeleportHeroBefore) >= TELEPORT_HERO_MIN_MOVE)
-                MoveTeleportFollowers("the hero has arrived");
-        }
+        using GroupLogic::IsTeleportFollower;
+        using GroupLogic::TryLateCollect;
+        using GroupLogic::LogTeleportRecord;
+        using GroupLogic::CollectTeleportFollowers;
+        using GroupLogic::FinishTeleportFollowers;
+        using GroupLogic::PollTeleportFollowers;
     } // namespace
 
     // v1.0.59.0: THE STANCE SAYS THE LINE OF THE WARNING. The native state ZS_ReactToDamage speaks its line when it is entered; the
@@ -6721,18 +3242,425 @@ namespace RequirementsCheck
         return ZS_ReactToDamage_Original(a_rRunTimeStack, a_pSPU);
     }
 
-    // v1.0.40.0: THE STATES OF THE HERO (RequirementsCheck hooks SetCurrentTask / AISetTask / SetCurrentState / AISetState of the
-    // routine of the hero and reports every change here, the names are the ones of the log: PS_Magic, PS_Magic_Reload,
-    // PS_Magic_Loop, PS_Magic_QuickCast, ...).
-    //  - the task PS_Magic (a rune / a scroll taken in the hand) with the Running arena quest and the hero in the ring ->
-    //    stage 1 (the opponent takes the stance of the first blow and warns once);
-    //  - the task leaves PS_Magic (PS_Normal / PS_Melee / ...) -> the opponent goes back to the melee duel;
-    //  - the substate of the cast itself (PS_Magic_QuickCast, PS_Magic_Cast, PS_Magic_PowerCast, PS_Magic_Summon) -> stage 2.
-    //  A health potion is PS_MagicPotion / PS_QuickUse, not PS_Magic: it is ignored here.
-    void OnHeroRoutineChange(GELPCChar a_strName, GEBool a_bIsTask)
+        ME_DEFINE_AND_HOOK_SCRIPT(MagicTeleport)
     {
-        if (!a_strName || !a_strName[0])
-            return;
+        return GroupLogic::Waiting::MagicTeleport(MagicTeleport_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
+    }
+
+    // v1.0.50.0: THE PLAQUE "<name> IS WAITING". The native MagicTeleport runs the script WaitPlayerParty for every member of
+    // the party of the types 1..3 (disassembly of Script_Game.dll: the script 100A8F40 prints the text GO_SlaveDismiss with
+    // GUI2::PrintGameMessage, then Waiting = true, FullStop, ZS_WaitForPlayer). A companion that the plugin has collected is
+    // carried to the hero, so for him the script is not run at all: no plaque, no waiting, an unbroken interface. For the
+    // ones that are not collected (told to wait by the hero in the dialogue, a type 4 / 5) the original runs unchanged, and
+    // for a collected one whose move failed the plugin shows the plaque itself (RestoreNativeWait). Outside the teleport
+    // spell (g_bTeleportScriptRuns is false) the script is never touched.
+        ME_DEFINE_AND_HOOK_SCRIPT(WaitPlayerParty)
+    {
+        return GroupLogic::Waiting::WaitPlayerParty(WaitPlayerParty_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
+    }
+
+    // The native OnTick of every NPC runs unchanged (the distance, the dismissal of the summons, the return home of the
+    // tamed): the plugin does not look at the creatures under control any more.
+        ME_DEFINE_AND_HOOK_SCRIPT(OnTick)
+    {
+        return PluginRuntime::Loops::OnTick(OnTick_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
+    }
+
+        ME_DEFINE_AND_HOOK_SCRIPT(HasAttackReasonToKill)
+    {
+        return PluginRuntime::Combat::HasAttackReasonToKill(HasAttackReasonToKill_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
+    }
+
+    //
+    // WantToRansack(npc, hero): the NPC takes the weapon and the gold of the knocked-out hero. The native script refuses
+    // for a class Mage / Paladin, but the hero was robbed anyway after the mercy of the plugin. So the exception is
+    // enforced here: a Mage / Paladin (the hero or the NPC himself) is never ransacked while the mercy is applied.
+    //
+        ME_DEFINE_AND_HOOK_SCRIPT(GiveXP)
+    {
+        return GroupLogic::Lifecycle::GiveXP(GiveXP_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
+    }
+
+        ME_DEFINE_AND_HOOK_SCRIPT(JoinPlayerParty)
+    {
+        return GroupLogic::Lifecycle::JoinPlayerParty(JoinPlayerParty_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
+    }
+
+    
+
+    
+
+    
+
+        ME_DEFINE_AND_HOOK_SCRIPT(WantToRansack)
+    {
+        return PluginRuntime::Combat::WantToRansack(WantToRansack_Original, a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
+    }
+
+    //
+    // Stage 4: no difficulty speed-up of the arena opponent. The animation speed of an NPC is set through
+    // Entity::SetTimeScale / PSRoutine::SetTimeScale (Script.dll). During an arena fight a value above 1.0 for the
+    // opponent is replaced by the base speed 1.0. A value below 1.0 (weakness slows the NPC down, freezing sets 0) is
+    // never touched, so a weakened opponent is honestly slowed. (Game 1.8.7 has no gECharacterState_Weak enum.)
+    //
+    namespace
+    {
+        GEFloat ClampOpponentTimeScale(eCEntity *a_pOwner, GEFloat a_fScale)
+        {
+            // v1.0.59.0: EnableHardDifficultyAttackSpeed=true: the native speed-up of the arena opponent returns (no clamp).
+            if (GetConfig().EnableHardDifficultyAttackSpeed || a_fScale <= 1.0f || !a_pOwner)
+                return a_fScale;
+            Entity Owner(a_pOwner);
+            Entity Opponent;
+            if (FindArenaOpponent(Opponent) && Owner == Opponent)
+                return 1.0f;
+            return a_fScale;
+        }
+
+        // gCSession::Start(mode) / gCSession::Stop() (Game.dll): a save game is loaded (mode LoadGame = 1) or a new game
+        // starts (mode NewGame = 0) / the session ends. The state of the beating lives in the plugin only, so it is
+        // forgotten here, before the original runs (the original also stops a running session itself).
+        // v1.0.60.0: GUI2::PrintGameMessage (Script.dll). The native end of the arena (ZS_Arena_Loop / ZS_Attack_Loop: the hero left the
+        // ring) says the line "YouLeftTheArena" and prints the text GO_ArenaWarning with the message type Failure (13; disassembly of
+        // Script_Game.dll 1.8.7: push 0Dh before the call). While the plaque is blocked (the voice of the end of the arena is heard
+        // instead of it: the cancelled duel, the voice over the fallen hero) a Failure message is swallowed; every other message and every
+        // message outside the window passes untouched. The plugin itself prints no Failure message any more.
+        mCFunctionHook Hook_GuiPrintGameMessage;
+        void GE_STDCALL GuiPrintGameMessage(GUI2 *a_pThis, bCUnicodeString const *a_pText, gEGameMessageType a_enuType)
+        {
+            return ArenaJudge::Native::GuiPrintGameMessage(a_pThis, a_pText, a_enuType,
+                Hook_GuiPrintGameMessage.GetOriginalFunction<ArenaJudge::Native::GuiPrintGameMessageOriginal>());
+        }
+
+
+
+
+
+
+
+
+
+
+        mCFunctionHook Hook_EntitySetTimeScale;
+        void GE_STDCALL EntitySetTimeScale(Entity *a_pThis, GEFloat a_fScale)
+        {
+            return ArenaJudge::Native::EntitySetTimeScale(a_pThis, a_fScale,
+                Hook_EntitySetTimeScale.GetOriginalFunction<ArenaJudge::Native::EntitySetTimeScaleOriginal>());
+        }
+
+        mCFunctionHook Hook_RoutineSetTimeScale;
+        void GE_STDCALL RoutineSetTimeScale(PSRoutine *a_pThis, GEFloat a_fScale)
+        {
+            return ArenaJudge::Native::RoutineSetTimeScale(a_pThis, a_fScale,
+                Hook_RoutineSetTimeScale.GetOriginalFunction<ArenaJudge::Native::RoutineSetTimeScaleOriginal>());
+        }
+
+        // PSParty::GetPartyLeader (Script.dll): THE PARTY FOLLOWS THE MASTER IN ANY FORM. A transformation (scroll,
+        // potion) makes a separate creature the player (Entity::GetPlayer()), while the party of the hero stays bound to
+        // his own human body "PC_Hero", which is hidden meanwhile. Every native check "the leader is the player" (follow
+        // state, the blue name in the group, "is a companion") then fails: the companions turn grey, drop out of the
+        // group and stop following. Here the leader that is the hidden body PC_Hero is reported as the player, but only
+        // for a creature that really belongs to the party (types 1..5); the body itself and strangers are untouched.
+        mCFunctionHook Hook_PartyGetLeader;
+        Entity *GE_STDCALL PartyGetLeader(PSParty *a_pThis, Entity *a_pRet)
+        {
+            return GroupLogic::Lifecycle::PartyGetLeader(a_pThis, a_pRet,
+                Hook_PartyGetLeader.GetOriginalFunction<GroupLogic::Lifecycle::PartyGetLeaderOriginal>());
+        }
+
+        // PSNpc::CanHit(minDuration) (Script.dll): may the NPC hit now? minDuration is MinHitDuration of ge3.ini (the
+        // callers pass it); the answer is "enough time has passed since the last hit". The native function skips the whole
+        // delay for an NPC whose attack reason is Arena (0x12) (and for a zombie), on every difficulty, so the arena
+        // opponent attacked without any pause. For the time of the call the reason Arena is hidden behind Duel (0x11, which
+        // CanHit does not know), so the opponent keeps the delay of the ini like every other NPC, and it is put back at
+        // once. Nothing else reads the reason inside this call.
+        mCFunctionHook Hook_NpcCanHit;
+        GEBool GE_STDCALL NpcCanHit(PSNpc *a_pThis, GEU32 a_u32MinDuration)
+        {
+            return ArenaJudge::Native::NpcCanHit(a_pThis, a_u32MinDuration,
+                Hook_NpcCanHit.GetOriginalFunction<ArenaJudge::Native::NpcCanHitOriginal>());
+        }
+
+        // gCQuest_PS::SetStatus(gEQuestStatus const &) (Game.dll, called directly by OnNPCDefeated and the dialogue
+        // scripts). When the opponent of the duel was knocked out by somebody who is not the hero, the quest of the arena
+        // must not become Success / Won: it becomes Lost (the status that also switches the arena off). Every other
+        // quest and every other status pass through untouched. This is the hook that worked in the first versions.
+        mCFunctionHook Hook_QuestSetStatus;
+        GEBool GE_STDCALL QuestSetStatus(gCQuest_PS *a_pThis, gEQuestStatus const *a_penuStatus)
+        {
+            return ArenaJudge::Native::QuestSetStatus(a_pThis, a_penuStatus,
+                Hook_QuestSetStatus.GetOriginalFunction<ArenaJudge::Native::QuestSetStatusOriginal>(), _ReturnAddress());
+        }
+
+        // Entity::DoDamage(source, amount, type) (Script.dll): the damage dealt by script code directly, bypassing
+        // DoLogicalDamage - the area spells (MagicAreaDamageTick: meteor, fire rain, hail ...) use it for every victim of
+        // the explosion. It is a thin wrapper: it forwards (source, 0, amount, type, 0, iterator) to the virtual
+        // gCEntity::DoDamage of the entity "this". The check below is symmetric (both sides must be under the control of
+        // the hero), so it does not matter which side is which. The source is the owner of the spell (the chain of owners
+        // is followed by GetDamageOwnerNpc). Blocked: the call is not forwarded at all, so no damage is done.
+        mCFunctionHook Hook_EntityDoDamage;
+        void GE_STDCALL EntityDoDamage(Entity *a_pThis, Entity const *a_pSource, GEU32 a_u32Amount,
+                                       gEDamageType a_enuType)
+        {
+            return PluginRuntime::Native::EntityDoDamage(a_pThis, a_pSource, a_u32Amount, a_enuType,
+                Hook_EntityDoDamage.GetOriginalFunction<PluginRuntime::Native::EntityDoDamageOriginal>());
+        }
+
+        // The animation speed of the arena opponent on the hard difficulty. The script function that returns the animation
+        // speed of an NPC (Script_Game.dll 1.8.7, RVA 0x42A0, called by every _AI_*Attack / parade / stumble) ends with
+        //   if (attackReason == Arena && GetCurrentDifficulty() == Hard) speed *= 1.25;
+        // i.e. at RVA 0x4DB6 "cmp eax,12h / jne", at 0x4DB8 "call GetCurrentDifficulty", at 0x4DBE "cmp eax,2" and at 0x4DC1
+        // "jne 0x4DE3" (skip the multiplication). Only this ONE place is touched: the conditional jump becomes an
+        // unconditional one (75 -> EB, the same distance), so for the arena opponent the multiplication is never done, and
+        // the speed stays what it is on the medium difficulty. The base speed, the weakness slow-down (x0.75, a few
+        // instructions above) and every other difficulty rule are untouched. All bytes are checked before the write; on any
+        // other build of Script_Game.dll nothing is patched.
+        void RemoveArenaHardSpeedUp()
+        {
+            HMODULE hModule = ::GetModuleHandleA("Script_Game.dll");
+            if (!hModule)
+            {
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Script_Game.dll is not loaded: the arena speed-up of the "
+                                             "hard difficulty is left as it is.\n");
+                return;
+            }
+            GEU8 *pBase = reinterpret_cast<GEU8 *>(hModule);
+            // Bytes 2..5 are the ABSOLUTE address of the import slot of GetCurrentDifficulty. The DLL is not loaded at its
+            // preferred base (the crash log of the game shows Script_Game.dll at 0F7C0000, the file says 10000000), so the
+            // loader has rebased this address: it differs from the file and is NOT compared (the first version of this
+            // check compared it and therefore never patched anything - "differs from the expected one" in the log).
+            GEU8 const arrExpected[] = {0xFF, 0x15, 0x00, 0x00, 0x00, 0x00, // call dword ptr [GetCurrentDifficulty]
+                                        0x83, 0xF8, 0x02,                   // cmp eax, 2 (Hard)
+                                        0x75, 0x20};                        // jne +0x20 (skip the multiplication)
+            GEU8 *pPlace = pBase + 0x4DB8;
+            GEBool bSame = GETrue;
+            for (size_t i = 0; i < sizeof(arrExpected); ++i)
+            {
+                if (i >= 2 && i < 6)
+                    continue;
+                if (pPlace[i] != arrExpected[i])
+                    bSame = GEFalse;
+            }
+            if (!bSame)
+            {
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] The code of Script_Game.dll differs from the expected one "
+                                             "(bytes %02X %02X .. %02X %02X %02X %02X %02X): the arena speed-up of the "
+                                             "hard difficulty is left as it is.\n",
+                                             pPlace[0], pPlace[1], pPlace[6], pPlace[7], pPlace[8], pPlace[9], pPlace[10]);
+                return;
+            }
+            DWORD dwOld = 0;
+            GEU8 *pJump = pBase + 0x4DC1;
+            if (!::VirtualProtect(pJump, 1, PAGE_EXECUTE_READWRITE, &dwOld))
+            {
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Cannot unlock the code for the arena speed-up patch.\n");
+                return;
+            }
+            *pJump = 0xEB; // jne -> jmp short
+            DWORD dwDummy = 0;
+            ::VirtualProtect(pJump, 1, dwOld, &dwDummy);
+            ::FlushInstructionCache(::GetCurrentProcess(), pJump, 1);
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix] The x1.25 attack speed of the arena opponent on the hard "
+                                         "difficulty is removed.\n");
+        }
+    } // namespace
+
+    //
+    // v1.0.35.0: THE DIALOGUE WITH A TAMED / DOMINATED CREATURE ("Tame Animal", "Word of Control": party member type 4,
+    // the hero is the party leader). The engine refuses to talk to monsters and slaves, so the two native lines of the
+    // hero (owner "PC_Hero") are taken over for such a partner only:
+    //  - the info of the condition type Wait (34) becomes the line "Wait here"  -> task ZS_WaitForPlayer, Waiting = true;
+    //  - the info of the condition type Join (14) becomes the line "Follow me"  -> the combat state is reset, the task
+    //    ZS_FollowPlayer (and ContinueRoutine) is set, Waiting = false. It is offered at any time, so the hero can pull
+    //    a creature out of a combat stupor (after a fight, after a teleport).
+    // The native scripts of these two infos (CmdWait / CmdPartyJoin) are NOT run for such a partner: JoinPlayerParty would
+    // rewrite the party member type of the creature. Every other partner / info is left to the native code.
+    // Layout of gCInfo_PS (SDK asserts): m_bInfoGiven +0x18, m_enuCondType +0x28.
+    //
+    namespace
+    {
+
+
+
+
+
+
+
+
+
+
+
+        // gCInfo_PS::AreConditionsFulfilled() const (Game.dll): the line is offered for such a partner whatever the native
+        // rules (no talking to monsters / slaves) say. "Wait here" only while he does not wait yet.
+        mCFunctionHook Hook_InfoConditions;
+
+
+        GEBool GE_STDCALL InfoConditions(gCInfo_PS *a_pThis)
+        {
+            return GroupLogic::Waiting::InfoConditions(a_pThis,
+                Hook_InfoConditions.GetOriginalFunction<GroupLogic::Waiting::InfoConditionsOriginal>());
+        }
+
+        // gCInfo_PS::Execute(gCInfoManager_PS *) (Game.dll): the chosen line. The order is given at once, the native
+        // script is skipped and the dialogue is closed.
+        mCFunctionHook Hook_InfoExecute;
+        GEBool GE_STDCALL InfoExecute(gCInfo_PS *a_pThis, gCInfoManager_PS *a_pManager)
+        {
+            return GroupLogic::Waiting::InfoExecute(a_pThis, a_pManager,
+                Hook_InfoExecute.GetOriginalFunction<GroupLogic::Waiting::InfoExecuteOriginal>());
+        }
+
+        // gCInfo_PS::GetDialogDescription() const: the text of the line (hidden return buffer).
+        mCFunctionHook Hook_InfoDescription;
+        bCUnicodeString *GE_STDCALL InfoDescription(gCInfo_PS *a_pThis, bCUnicodeString *a_pRet)
+        {
+            return GroupLogic::Waiting::InfoDescription(a_pThis, a_pRet,
+                Hook_InfoDescription.GetOriginalFunction<GroupLogic::Waiting::InfoDescriptionOriginal>());
+        }
+
+        // Entity::HasInfo(other) const (Script.dll): "the hero has something to say to this NPC". The perception scripts
+        // (AssessTalk, the focus) ask it before the creature can be spoken to. True for such a creature.
+        mCFunctionHook Hook_EntityHasInfo;
+        GEBool GE_STDCALL EntityHasInfo(Entity *a_pThis, Entity const *a_pOther)
+        {
+            return GroupLogic::Waiting::EntityHasInfo(a_pThis, a_pOther,
+                Hook_EntityHasInfo.GetOriginalFunction<GroupLogic::Waiting::EntityHasInfoOriginal>());
+        }
+    } // namespace
+
+} // namespace ArenaJudge::Implementation
+
+namespace GroupLogic::Host
+{
+
+    GEBool IsArenaSessionHeld() { return ArenaJudge::Implementation::g_bArenaSessionHold; }
+    void EndArenaSession(GELPCChar why, GEBool cancelled, GEInt release)
+    { ArenaJudge::Implementation::EndArenaSession(why, cancelled, release); }
+    void PrintCompanionWaitMessage(Entity &npc) { ArenaJudge::Implementation::PrintCompanionWaitMessage(npc); }
+    WaiterType GetWaiterType(Entity &npc)
+    { return static_cast<WaiterType>(ArenaJudge::Implementation::GetWaiterType(npc)); }
+    GELPCChar WaiterTypeText(WaiterType type)
+    { return ArenaJudge::Implementation::WaiterTypeText(static_cast<ArenaJudge::Implementation::mEWaiterType>(type)); }
+    void ClearWaiterMarks(Entity &npc) { ArenaJudge::Implementation::ClearWaiterMarks(npc); }
+    void MarkWaiterAuto(Entity &npc) { ArenaJudge::Implementation::MarkWaiterAuto(npc); }
+}
+namespace SocialLogic::Host
+{
+    GEBool IsHeroSide(Entity &npc) { return ArenaJudge::Implementation::IsHeroSide(npc); }
+    GEBool FindArenaOpponent(Entity &npc) { return ArenaJudge::Implementation::FindArenaOpponent(npc); }
+    GEBool FindRememberedOpponent(Entity &npc) { return ArenaJudge::Implementation::FindRememberedOpponent(npc); }
+    GEBool HasRunningArenaQuest() { return ArenaJudge::Implementation::HasRunningArenaQuest(); }
+    GEBool IsHeroInsideArenaZone() { return ArenaJudge::Implementation::IsHeroInsideArenaZone(); }
+    GEBool HasTask(Entity &npc, GELPCChar task) { return ArenaJudge::Implementation::HasTask(npc, task); }
+    GEBool HasReacted(Entity &npc, Entity &hero) { return ArenaJudge::Implementation::HasReacted(npc, hero); }
+    GEBool IsAttackingHero(Entity &npc, Entity &hero) { return ArenaJudge::Implementation::IsAttackingHero(npc, hero); }
+    void ForceReaction(Entity &npc, Entity &hero) { ArenaJudge::Implementation::ForceReaction(npc, hero); }
+
+
+    void ResetDeclareThrottle() { ArenaJudge::Implementation::g_u32LastDeclare = 0; }
+
+}
+
+namespace SocialLogic::Host
+{
+    mEWitnessVerdict GetWitnessVerdict(Entity &npc, Entity &hero, Entity &victim, GELPCChar *reason)
+    { return static_cast<mEWitnessVerdict>(ArenaJudge::Implementation::GetWitnessVerdict(npc, hero, victim, GEFalse, reason)); }
+    void ForceAttack(Entity &npc, Entity &hero, gEAttackReason reason)
+    { ArenaJudge::Implementation::ForceAttack(npc, hero, reason); }
+}
+
+namespace GroupLogic::Host
+{
+    GEBool IsHeroSide(Entity &npc) { return ArenaJudge::Implementation::IsHeroSide(npc); }
+    Entity GetDamageOwnerNpc(Entity &source) { return ArenaJudge::Implementation::GetDamageOwnerNpc(source); }
+    GEBool IsPointMagicSource(Entity *source) { return ArenaJudge::Implementation::IsPointMagicSource(source); }
+    void StartFleeWatch(Entity &npc) { ArenaJudge::Implementation::StartFleeWatch(npc); }
+    void PollArenaQuestEnd() { ArenaJudge::Implementation::PollArenaQuestEnd(); }
+}
+
+namespace GroupLogic::Host { GEBool HasTask(Entity &npc, GELPCChar task) { return ArenaJudge::Implementation::HasTask(npc, task); } }
+
+namespace GroupLogic::Host
+{
+    GEBool IsDuelTaboo(Entity &npc) { return ArenaJudge::Implementation::IsDuelTaboo(npc); }
+    GEBool FindArenaOpponent(Entity &npc) { return ArenaJudge::Implementation::FindArenaOpponent(npc); }
+    GEBool HasRunningArenaQuest() { return ArenaJudge::Implementation::HasRunningArenaQuest(); }
+    GEBool IsInsideArenaZone(Entity &npc) { return ArenaJudge::Implementation::IsInsideArenaZone(npc); }
+    GELPCChar DamageTypeName(GEInt type) { return ArenaJudge::Implementation::DamageTypeName(type); }
+    void MarkWaiterUserPublic(Entity &npc) { ArenaJudge::Implementation::MarkWaiterUserPublic(npc); }
+    void ClearWaiterMarksPublic(Entity &npc) { ArenaJudge::Implementation::ClearWaiterMarksPublic(npc); }
+    GEBool WasArenaDuelActive() { return ArenaJudge::Implementation::g_bDuelWasActive; }
+}
+
+namespace SocialLogic::Host
+{
+    GEBool IsSentAgainstHero(Entity &npc) { return ArenaJudge::Implementation::IsSentAgainstHero(npc); }
+}
+
+namespace PluginRuntime::Host
+{
+    void ArmArenaAdoptAfterLoad() { ArenaJudge::Implementation::ArmArenaAdoptAfterLoad(); }
+
+    void ResetFormAggro() { ArenaJudge::Implementation::ResetFormAggro(); }
+
+    void ResetDuelState() { ArenaJudge::Implementation::ResetDuelState(); }
+}
+
+namespace PluginRuntime::Host
+{
+    NativeHookBinding const *GetNativeHookBindings(GEU32 &count)
+    {
+        static NativeHookBinding const bindings[] = {
+            {&ArenaJudge::Implementation::Hook_GuiPrintGameMessage, "?PrintGameMessage@GUI2@@QAEXABVbCUnicodeString@@W4gEGameMessageType@@@Z", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::GuiPrintGameMessage), "Script.dll"},
+            {&ArenaJudge::Implementation::Hook_SessionStart, "?Start@gCSession@@QAEXW4gESession_StartMode@@@Z", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::SessionStart), "Game.dll"},
+            {&ArenaJudge::Implementation::Hook_SessionStop, "?Stop@gCSession@@QAEXXZ", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::SessionStop), "Game.dll"},
+            {&PluginRuntime::Hook_SessionProcess, "?Process@gCSession@@UAEXXZ", reinterpret_cast<GELPVoid>(&PluginRuntime::SessionProcess), "Game.dll"},
+            {&ArenaJudge::Implementation::Hook_PersonalSlotDrop, "?DropItemsFromSlot@gCInventory_PS@@QAEPAVeCEntity@@W4gESlot@@HPBVbCMatrix@@@Z", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::PersonalSlotDrop), "Game.dll"},
+            {&ArenaJudge::Implementation::Hook_DialoguePartyMembers, "?GetMembers@PSParty@@QBE?AV?$bTValArray@PAVeCEntity@@@@_N@Z", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::DialoguePartyMembers), "Script.dll"},
+            {&GroupLogic::Lifecycle::Hook_SecondarySummonType, "?SetPartyMemberType@gCParty_PS@@QAEXABV?$bTPropertyContainer@W4gEPartyMemberType@@@@@Z", reinterpret_cast<GELPVoid>(&GroupLogic::Lifecycle::SecondarySummonType), "Game.dll"},
+            {&ArenaJudge::Implementation::Hook_DiagnosticStartDialogue, "?StartInfoManager@gCInfoManager_PS@@QAE_NAAVeCEntity@@0@Z", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::DiagnosticStartDialogue), "Game.dll"},
+            {&ArenaJudge::Implementation::Hook_BrawlSetHitPoints, "?SetHitPoints@gCDamageReceiver_PS@@QAEXABJ@Z", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::BrawlSetHitPoints), "Game.dll"},
+            {&ArenaJudge::Implementation::Hook_NpcSetCurrentAttacker, "?SetCurrentAttacker@PSNpc@@QAEXABVEntity@@@Z", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::NpcSetCurrentAttacker), "Script.dll"},
+            {&ArenaJudge::Implementation::Hook_NpcSetLastAttacker, "?SetLastAttacker@PSNpc@@QAEXABVEntity@@@Z", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::NpcSetLastAttacker), "Script.dll"},
+            {&ArenaJudge::Implementation::Hook_NpcSetLastCast, "?SetLastCast@PSNpc@@QAEXXZ", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::NpcSetLastCast), "Script.dll"},
+            {&ArenaJudge::Implementation::Hook_NpcEnableStatusEffects, "?EnableStatusEffects@PSNpc@@QAEXH_N@Z", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::NpcEnableStatusEffects), "Script.dll"},
+            {&ArenaJudge::Implementation::Hook_EntitySetTimeScale, "?SetTimeScale@Entity@@QAEXM@Z", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::EntitySetTimeScale), "Script.dll"},
+            {&ArenaJudge::Implementation::Hook_RoutineSetTimeScale, "?SetTimeScale@PSRoutine@@QAEXM@Z", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::RoutineSetTimeScale), "Script.dll"},
+            {&ArenaJudge::Implementation::Hook_NpcCanHit, "?CanHit@PSNpc@@QAE_NK@Z", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::NpcCanHit), "Script.dll"},
+            {&ArenaJudge::Implementation::Hook_QuestSetStatus, "?SetStatus@gCQuest_PS@@QAE_NABW4gEQuestStatus@@@Z", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::QuestSetStatus), "Game.dll"},
+            {&ArenaJudge::Implementation::Hook_EntityDoDamage, "?DoDamage@Entity@@QAEXABV1@KW4gEDamageType@@@Z", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::EntityDoDamage), "Script.dll"},
+            {&ArenaJudge::Implementation::Hook_DiagnosticProjectileShoot, "?Shoot@PSProjectile@@QAEXXZ", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::DiagnosticProjectileShoot), "Script.dll"},
+            {&ArenaJudge::Implementation::Hook_PartyGetLeader, "?GetPartyLeader@PSParty@@QBE?AVEntity@@XZ", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::PartyGetLeader), "Script.dll"},
+            {&ArenaJudge::Implementation::Hook_InfoConditions, "?AreConditionsFulfilled@gCInfo_PS@@IBE_NXZ", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::InfoConditions), "Game.dll"},
+            {&ArenaJudge::Implementation::Hook_InfoExecute, "?Execute@gCInfo_PS@@QAE_NPAVgCInfoManager_PS@@@Z", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::InfoExecute), "Game.dll"},
+            {&ArenaJudge::Implementation::Hook_InfoDescription, "?GetDialogDescription@gCInfo_PS@@QBE?AVbCUnicodeString@@XZ", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::InfoDescription), "Game.dll"},
+            {&ArenaJudge::Implementation::Hook_EntityHasInfo, "?HasInfo@Entity@@QBE_NABV1@@Z", reinterpret_cast<GELPVoid>(&ArenaJudge::Implementation::EntityHasInfo), "Script.dll"},
+        };
+        count = static_cast<GEU32>(sizeof(bindings) / sizeof(bindings[0]));
+        return bindings;
+    }
+    void RemoveArenaHardSpeedUp() { ArenaJudge::Implementation::RemoveArenaHardSpeedUp(); }
+    void PatchReactToDamageSvm() { ArenaJudge::Implementation::PatchReactToDamageSvm(); }
+}
+
+namespace PluginRuntime::Host
+{
+    GEBool IsArenaKnockout(Entity &victim)
+    {
+        using namespace ArenaJudge::Implementation;
+        if (victim == None || !victim.IsNPC() || !HasRunningArenaQuest())
+            return GEFalse;
+        Entity opponent;
+        return IsHeroInsideArenaZone() ||
+            ((FindArenaOpponent(opponent) || FindRememberedOpponent(opponent)) && victim == opponent);
+    }
+}
+
+namespace PluginRuntime::Host
+{
+    void OnArenaRoutineChange(GELPCChar a_strName, GEBool a_bIsTask)
+    {
+        using namespace ArenaJudge::Implementation;
         if (_strnicmp(a_strName, "PS_MagicPotion", 14) == 0)
             return;
         // v1.0.52.0: THE BOW / CROSSBOW (PS_Ranged*), the same two stages as the magic:
@@ -6764,66 +3692,192 @@ namespace RequirementsCheck
         if (_stricmp(a_strName, "PS_Magic_QuickCast") == 0 || _stricmp(a_strName, "PS_Magic_Cast") == 0 ||
             _stricmp(a_strName, "PS_Magic_PowerCast") == 0 || _stricmp(a_strName, "PS_Magic_Summon") == 0)
             PunishMagicCast(a_strName);
-    }
-    ME_DEFINE_AND_HOOK_SCRIPT(MagicTeleport)
-    {
-        Entity Caster = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-        if (Caster == None || !IsHeroSide(Caster))
-            return MagicTeleport_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
+        }
 
-        // Before the native script: who of the types 1..3 follows the hero (the native script puts them to wait and prints
-        // "<name> is waiting"). The types 4 / 5 are left to the native script completely (v1.0.50.0: no tracker, no messages).
-        CollectTeleportFollowers();
-        g_bTeleportScriptRuns = GETrue; // the plaque "<name> is waiting" of a collected companion is held back meanwhile
-        GEInt const iResult = MagicTeleport_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
-        g_bTeleportScriptRuns = GEFalse;
-        FinishTeleportFollowers("MagicTeleport");
-        return iResult;
-    }
+}
 
-    // v1.0.50.0: THE PLAQUE "<name> IS WAITING". The native MagicTeleport runs the script WaitPlayerParty for every member of
-    // the party of the types 1..3 (disassembly of Script_Game.dll: the script 100A8F40 prints the text GO_SlaveDismiss with
-    // GUI2::PrintGameMessage, then Waiting = true, FullStop, ZS_WaitForPlayer). A companion that the plugin has collected is
-    // carried to the hero, so for him the script is not run at all: no plaque, no waiting, an unbroken interface. For the
-    // ones that are not collected (told to wait by the hero in the dialogue, a type 4 / 5) the original runs unchanged, and
-    // for a collected one whose move failed the plugin shows the plaque itself (RestoreNativeWait). Outside the teleport
-    // spell (g_bTeleportScriptRuns is false) the script is never touched.
-    ME_DEFINE_AND_HOOK_SCRIPT(WaitPlayerParty)
+namespace GroupLogic::Host
+{
+    GEBool HasArenaWaiterName(bCString const &name) { return ArenaJudge::Implementation::FindWaiter(name) >= 0; }
+    void RemoveArenaWaiterName(bCString const &name)
+    { ArenaJudge::Implementation::RemoveNameFrom(ArenaJudge::Implementation::g_arrWaiters, ArenaJudge::Implementation::g_iWaiterCount, name); }
+}
+
+
+
+namespace ArenaJudge::Punishment
+{
+
+    GEBool FinishIfHeroDead()
     {
-        if (g_bTeleportScriptRuns)
+        using namespace ArenaJudge::Implementation;
+        static GEBool finishing = GEFalse;
+        Entity hero = Entity::GetPlayer();
+        if (finishing || !IsArmed() || !IsArenaPunishment() || hero == None || !hero.IsDead())
+            return GEFalse;
+        finishing = GETrue;
+        bCString const heldOpponent = g_strStage2Hold;
+        g_strStage2Hold = bCString();
+        g_u32Stage2HoldTick = 0;
+        g_bOverLinePending = GEFalse;
+        GEInt released = 0;
+        bTObjArray<Entity> npcs = Entity::GetNPCs();
+        for (GEInt i = 0; i < npcs.GetCount(); ++i)
         {
-            Entity Member = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-            if (Member != None && IsTeleportFollower(Member))
-                return 1; // he is carried to the hero: neither the plaque nor the waiting
-            if (Member != None && Member != Entity::GetPlayer() && TryLateCollect(Member))
-                return 1; // v1.0.69.0: the net - the collection missed him, he is carried all the same
-            // v1.0.68.0: the native script puts the rest of the party to wait during the cast: that wait is the GAME's (AUTO), not the
-            // player's - unless he already waited before the cast (the order of the player, kept as it is).
-            if (Member != None && !Member.Party.Waiting)
+            Entity npc = npcs.GetAt(i);
+            if (npc == None || !npc.IsNPC() || npc.IsDead() || npc.IsDown()) continue;
+            GEBool const official = (!heldOpponent.IsEmpty() && npc.GetName() == heldOpponent) ||
+                (!g_strArenaOpponent.IsEmpty() && npc.GetName() == g_strArenaOpponent);
+            if (!(official || IsCurrentArenaWitness(npc))) continue;
+            Entity target = npc.NPC.GetCurrentTarget();
+            // End only the punishment of this hero; preserve unrelated combat.
+            if (target != hero && !(official && target == None)) continue;
+            if (official)
+                EndArenaFightOfOpponent(npc);
+            else
             {
-                GEInt const iResult = WaitPlayerParty_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
-                if (Member.Party.Waiting)
-                {
-                    MarkWaiterAutoPublic(Member);
-                    Entity NativeWaitHero = Entity::GetPlayer();
-                    LogTeleportRecord("native wait", Member, NativeWaitHero, "AUTO",
-                                      "the native script WaitPlayerParty put him to wait during the cast; the next stone carries him");
-                }
-                return iResult;
+                npc.Routine.FullStop();
+                npc.NPC.SetCurrentTarget(None);
+                npc.NPC.SetAlternativeTarget(None);
+                npc.NPC.SetCurrentAttacker(None);
+                npc.NPC.AttackReason = gEAttackReason_None;
+                npc.NPC.CombatState = 0;
+                npc.Routine.ContinueRoutine();
+            }
+            ++released;
+        }
+        ResetSpare();
+        ClearAggro();
+        DebugLog::GetLogger().LogFormat("[GenomeLogicFix][arena-punishment] hero dead: punishment ended, %d attacker(s) released.\n", released);
+        finishing = GEFalse;
+        return GETrue;
+    }
+        GEBool IsCurrentArenaWitness(Entity &npc)
+        {
+            using namespace ArenaJudge::Implementation;
+
+            if (npc == None)
+                return GEFalse;
+            for (GEInt i = 0; i < g_iArenaWitnessCount; ++i)
+                if (g_arrArenaWitnessID[i] == npc.GetInstance()->GetID())
+                    return GETrue;
+            return GEFalse;
+        }
+        void NoteCurrentArenaWitness(Entity &npc)
+        {
+            using namespace ArenaJudge::Implementation;
+
+            if (g_iArenaWitnessCount < AGGRO_MAX && !IsCurrentArenaWitness(npc))
+                g_arrArenaWitnessID[g_iArenaWitnessCount++] = npc.GetInstance()->GetID();
+        }
+
+        // The arena owns this exception; social and group rules outside it stay native.
+        GEBool IsArenaPunishmentActor(Entity &npc)
+        {
+            using namespace ArenaJudge::Implementation;
+
+            return IsArmed() && IsArenaPunishment() && npc != None && npc.IsNPC() &&
+                (IsCurrentArenaWitness(npc) ||
+                 (!g_strArenaOpponent.IsEmpty() && npc.GetName() == g_strArenaOpponent));
+        }
+        GEBool IsArenaPunishmentBlow(Entity &victim, Entity &attacker)
+        {
+            using namespace ArenaJudge::Implementation;
+
+            return (IsHeroSide(victim) && IsArenaPunishmentActor(attacker)) ||
+                   (IsHeroSide(attacker) && IsArenaPunishmentActor(victim));
+        }
+        GEBool IgnoreArenaPunishmentTarget(Entity &observer, Entity &actor)
+        {
+            using namespace ArenaJudge::Implementation;
+
+            if (observer == None || !observer.IsNPC() || observer == actor ||
+                !IsArenaPunishmentActor(actor) ||
+                !(IsHeroControlled(observer) || IsArenaPunishmentActor(observer)))
+                return GEFalse;
+            // Direct attacks on this NPC still permit self-defence.
+            if (observer.NPC.GetCurrentAttacker() == actor || observer.NPC.GetLastAttacker() == actor)
+                return GEFalse;
+            return GETrue;
+        }
+        void LogArenaPunishmentFilter(Entity &observer, Entity &actor, GELPCChar where)
+        {
+            using namespace ArenaJudge::Implementation;
+
+            static GEInt lines = 0;
+            if (lines++ < 80)
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix][arena-punishment] %s: '%s' ignores lawful punishment by '%s'.\n",
+                    where, observer.GetName().GetText(), actor.GetName().GetText());
+        }
+
+        // v1.0.61.0: the hero fell (stage 2): the opponent stops the fight and goes away, and says the line over the hero that lies on the
+        // sand (the voice and the silence of a lying opponent are decided by ScheduleOverLine / SayArenaLine; no text on the screen).
+        void ReleaseStage2Hold(GELPCChar a_strWhy)
+        {
+            using namespace ArenaJudge::Implementation;
+
+            if (g_strStage2Hold.IsEmpty())
+                return;
+            bCString const strName = g_strStage2Hold;
+            g_strStage2Hold = bCString();
+            Entity Opponent = Entity::GetEntity(strName);
+            if (Opponent == None || !Opponent.IsNPC() || Opponent.IsDead())
+                return;
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Arena, stage 2: the hero is down (%s) - the opponent '%s' stops the fight "
+                                         "and leaves.\n",
+                                         a_strWhy, Opponent.GetName().GetText());
+            ScheduleOverLine(Opponent); // the plaque is blocked, the line is said when the hero lies; silent if he lies himself
+            if (!Opponent.IsDown())
+                EndArenaFightOfOpponent(Opponent);
+        }
+
+        // v1.0.61.0: keeps the opponent of stage 2 in the attack (the engine may take him out of ZS_Attack when the duel quest is closed:
+        // the log showed ZS_ReactToDamage_Loop). Called from the tick of every NPC; one flag read when idle, a technical throttle.
+        void PollStage2Hold()
+        {
+            if (FinishIfHeroDead()) return;
+
+            using namespace ArenaJudge::Implementation;
+
+            if (g_strStage2Hold.IsEmpty())
+                return;
+            GEU32 const u32Now = ::GetTickCount();
+            if (g_u32Stage2HoldTick != 0 && static_cast<GEInt>(u32Now - g_u32Stage2HoldTick) < 400)
+                return;
+            g_u32Stage2HoldTick = u32Now | 1;
+            Entity Hero = Entity::GetPlayer();
+            if (Hero == None || !IsArmed())
+            {
+                g_strStage2Hold = bCString(); // the mercy is over: nobody holds him
+                return;
+            }
+            if (IsHeroKnockedOut())
+            {
+                ReleaseStage2Hold("the knock-out is seen"); // the Defeat hook did not run for this fall
+                return;
+            }
+            Entity Opponent = Entity::GetEntity(g_strStage2Hold);
+            if (Opponent == None || !Opponent.IsNPC() || Opponent.IsDead() || Opponent.IsDown())
+            {
+                g_strStage2Hold = bCString();
+                return;
+            }
+            if (IsAttackingHero(Opponent, Hero))
+                return;
+            ForceAttack(Opponent, Hero, gEAttackReason_Enemy);
+            static GEInt s_iLines = 0;
+            if (s_iLines < 40)
+            {
+                ++s_iLines;
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] Arena, stage 2: the opponent '%s' is put back into the attack on the "
+                                             "hero (the engine took him out of it).\n",
+                                             Opponent.GetName().GetText());
             }
         }
-        return WaitPlayerParty_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
-    }
-
-    // The native OnTick of every NPC runs unchanged (the distance, the dismissal of the summons, the return home of the
-    // tamed): the plugin does not look at the creatures under control any more.
-    ME_DEFINE_AND_HOOK_SCRIPT(OnTick)
+    void OnArenaNpcTick(Entity &Self)
     {
-        Entity Self = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-        if (Self == None || !Self.IsNPC() || Self == Entity::GetPlayer())
-            return OnTick_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
-
-        PollTeleportFollowers(); // v1.0.49.0: the late move of the companions after a teleport (one flag read when idle)
+        using namespace ArenaJudge::Implementation;
+        if (FinishIfHeroDead()) return;
         PollWarnTimer();         // v1.0.58.0: the 5 s timer of the warning of the forbidden weapon (one flag read when idle)
         PollOverLine();          // v1.0.60.0: the voice of the opponent over the fallen hero (one flag read when idle)
         PollStage2Hold();        // v1.0.61.0: the opponent of stage 2 stays in the attack on the hero (one flag read when idle)
@@ -6836,27 +3890,226 @@ namespace RequirementsCheck
         else
             PreemptMagicWarning(Self);
 
-        return OnTick_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
     }
+}
 
-    ME_DEFINE_AND_HOOK_SCRIPT(HasAttackReasonToKill)
+namespace ArenaJudge::Combat
+{
+    void OnHeroConsumeStarted() { ArenaJudge::Implementation::OnHeroConsumeStarted(); }
+
+    DamageContext BeforeDamage(Entity &Victim, Entity &Source)
     {
-        GEInt const iResult = HasAttackReasonToKill_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
-        if (!iResult)
-            return iResult;
+        using namespace ArenaJudge::Implementation;
+        Entity Opponent;
+        // The duel opponent is protected from the hero's elemental magic from the moment the duel is on, not only once the
+        // fight physically started (the hit itself can be the first action of the hero).
+        GEBool const bArenaVictim = FindArenaOpponent(Opponent) && Victim == Opponent && IsHeroInsideArenaZone();
+        GEBool const bWasFrozen = bArenaVictim && Victim.NPC.IsFrozen();
+        GEBool const bWasBurning = bArenaVictim && Victim.NPC.IsBurning();
+        // v1.0.48.0: the hero in a monster body: the duel judging below is skipped (the native code runs as it is).
+        GEBool const bDuelBlocked = bArenaVictim && IsHeroDuelBlocked();
 
-        Entity Self = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-        Entity Other = ResolveEntity(a_pOtherEntity, a_pSPU->GetOtherEntity());
-        Entity Hero = Entity::GetPlayer();
-        // The creatures of the party never strike the final blow at their fallen master.
-        if (IsMasterDownVictim(Self, Other))
-            return 0;
-        // A summon / companion of the hero does not finish off an NPC who is not red for the hero.
-        if (FollowerMustSpare(Self, Other, "HasAttackReasonToKill"))
-            return 0;
-        if (Self == None || Self == Hero || !(Other == Hero) || !Self.IsNPC())
-            return iResult;
+        GELPCChar strReason = nullptr;
+        GEBool bRangedHit = GEFalse; // v1.0.52.0: an arrow / bolt of the hero hits the opponent in the ring
+        if (bArenaVictim)
+        {
+            gEDamageType const enuType = GetHitDamageType(Source, Victim);
+            GEBool const bOwnedByOpponent = Source != None && Source.Interaction.IsValid() &&
+                                            Source.Interaction.GetOwner() == Opponent;
+            static GEInt s_iArenaDiagLines = 0;
+            if (s_iArenaDiagLines < 200)
+            {
+                ++s_iArenaDiagLines;
+                GEInt const iOwnType = Source != None && Source.Damage.IsValid()
+                                           ? static_cast<GEInt>(Source.Damage.DamageType)
+                                           : -1;
+                GEBool const bOwnedByHero = Source != None && Source.Interaction.IsValid() &&
+                                            Source.Interaction.GetOwner() == Entity::GetPlayer();
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix][diag] arena hit on '%s': source='%s' (own type=%d, "
+                                             "owned by hero=%d), damageType=%d, ownedByOpponent=%d, "
+                                             "burning=%d, frozen=%d, fightStarted=%d\n",
+                                             Victim.GetName().GetText(),
+                                             Source != None ? Source.GetName().GetText() : "-", iOwnType,
+                                             static_cast<int>(bOwnedByHero), static_cast<int>(enuType),
+                                             static_cast<int>(bOwnedByOpponent),
+                                             static_cast<int>(Victim.NPC.IsBurning()),
+                                             static_cast<int>(Victim.NPC.IsFrozen()),
+                                             static_cast<int>(IsArenaFightStarted()));
+            }
+            // v1.0.52.0: the elemental damage of a burning / frozen opponent that comes from an enchanted melee weapon is allowed
+            // (AllowArenaEnchantedWeapons); a cast, a shot or a bow in the hands keeps it forbidden.
+            // v1.0.52.0: the second net of the shot of a bow / crossbow: an arrow / bolt of the hero reaches the opponent.
+            if (enuType == gEDamageType_Missile && !bOwnedByOpponent && !bDuelBlocked && Source != None &&
+                Source.Interaction.IsValid() && Source.Interaction.GetOwner() == Entity::GetPlayer())
+                bRangedHit = GETrue;
+            GEBool const bEnchantedTick = (Victim.NPC.IsBurning() || Victim.NPC.IsFrozen()) && IsEnchantedMeleeEffect();
+            if (IsElementalDamage(enuType) && !bOwnedByOpponent && !bDuelBlocked && !bEnchantedTick)
+                strReason = "forbidden fire / ice / lightning damage in the arena";
+        }
+        return {Opponent, bArenaVictim, bWasFrozen, bWasBurning, bDuelBlocked, strReason, bRangedHit};
+    }
+    void AfterDamage(DamageContext &state, Entity &Victim)
+    {
+        using namespace ArenaJudge::Implementation;
+        auto &bArenaVictim = state.bArenaVictim;
+        auto &bWasFrozen = state.bWasFrozen;
+        auto &bWasBurning = state.bWasBurning;
+        auto &bDuelBlocked = state.bDuelBlocked;
+        auto &strReason = state.strReason;
+        auto &bRangedHit = state.bRangedHit;
+        if (!strReason && bArenaVictim && !bDuelBlocked && !Victim.IsDead())
+        {
+            if (!IsEnchantedMeleeEffect()) // v1.0.52.0: the status of an enchanted melee weapon is allowed
+            {
+                if (!bWasFrozen && Victim.NPC.IsFrozen())
+                    strReason = "the arena opponent was frozen";
+                else if (!bWasBurning && Victim.NPC.IsBurning())
+                    strReason = "the arena opponent was set on fire";
+            }
+        }
+        if (bRangedHit)
+            PunishRangedShot("an arrow / a bolt hits the opponent");
+        if (strReason)
+            DeclareHeroCriminal(strReason);
+    }
+    DefeatContext BeforeDefeat(Entity &Self, Entity &Hero)
+    {
+        using namespace ArenaJudge::Implementation;
+        DefeatContext state;
+        if (Self == Hero && IsArenaPunishment())
+        {
+            // v1.0.60.0: the hero falls after a violation of the arena (the crowd punishes him): the opponent will speak over him.
+            Entity ViolationOpponent;
+            if (FindArenaOpponent(ViolationOpponent) || FindRememberedOpponent(ViolationOpponent) ||
+                FindDuelOpponentAnywhere(ViolationOpponent))
+                ScheduleOverLine(ViolationOpponent);
+        }
+        // v1.0.61.0: stage 2: the hero is knocked out - the opponent held in the fight stops it and leaves (the voice over the hero).
+        if (Self == Hero)
+            ReleaseStage2Hold("Defeat of the hero");
+        if (Self == Hero)
+        {
+            PluginRuntime::Conflict::BeginNewFall(); // a new knock-out: the fall point is taken anew
+            BeginHeroImmunity();      // v1.0.57.0: from now until he stands on his feet nobody may kill the hero
+            RememberHeroFall(GEFalse); // mercy: the place where the hero fell (the arena loss is handled right below)
+        }
 
+        // The OPPONENT of the duel is knocked out by somebody who is not the hero (a witness, a companion, a summon): the
+        // quest must not become a victory - the fight is lost. The one who dealt the blow is the current attacker of the
+        // knocked-out NPC (the last attacker when it is empty); nobody written down (a burning tick of the hero's fire) is
+        // not a third party.
+        GEBool &bThirdParty = state.bThirdParty;
+        if (!(Self == Hero) && Self.IsNPC() && HasRunningArenaQuest())
+        {
+            Entity OppSeen;
+            GEBool bIsOpponent = FindArenaOpponent(OppSeen) && OppSeen == Self;
+            if (!bIsOpponent && !g_strArenaOpponent.IsEmpty() && Self.GetName() == g_strArenaOpponent)
+                bIsOpponent = GETrue;
+            if (bIsOpponent)
+            {
+                Entity Who = Self.NPC.GetCurrentAttacker();
+                if (Who == None)
+                    Who = Self.NPC.GetLastAttacker();
+                if (Who != None && !(Who == Hero) && Who.IsNPC())
+                {
+                    bThirdParty = GETrue;
+                    g_bLostToThirdParty = GETrue; // the status hook turns Success / Won into Lost
+                    DebugLog::GetLogger().LogFormat("[GenomeLogicFix] The arena opponent '%s' is knocked out by '%s', not by "
+                                                 "the hero: the duel is lost.\n",
+                                                 Self.GetName().GetText(), Who.GetName().GetText());
+                }
+            }
+        }
+
+        Entity &Opponent = state.Opponent;
+        GEBool &bForcedLoss = state.bForcedLoss;
+        // The arena fight is on: the opponent is found by his attack reason, or - when the reason already changed
+        // (witnesses attack the hero too) - by the remembered name while the duel quest still runs.
+        GEBool bArenaOn = GEFalse;
+        if (Self == Hero)
+        {
+            GEBool const bQuest = HasRunningArenaQuest();
+            bArenaOn = (IsArenaFightStarted() && FindArenaOpponent(Opponent)) ||
+                       (bQuest && (FindArenaOpponent(Opponent) || FindRememberedOpponent(Opponent)));
+            static GEInt s_iDefeatLines = 0;
+            if (s_iDefeatLines < 60)
+            {
+                ++s_iDefeatLines;
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix][diag] Defeat of the hero: duel quest running=%d, "
+                                             "arena fight=%d, opponent '%s' -> %s\n",
+                                             static_cast<int>(bQuest), static_cast<int>(IsArenaFightStarted()),
+                                             Opponent != None ? Opponent.GetName().GetText() : "-",
+                                             bArenaOn ? "arena knock-out" : "not an arena fight");
+            }
+        }
+        if (bArenaOn)
+        {
+            Entity Attacker = Hero.NPC.GetCurrentAttacker();
+            GEBool const bByOpponent = Attacker == Opponent;
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix] The hero is knocked out in the arena fight (opponent '%s', "
+                                         "knocked out by '%s').\n",
+                                         Opponent.GetName().GetText(),
+                                         Attacker != None ? Attacker.GetName().GetText() : "-");
+            if (!bByOpponent)
+            {
+                bForcedLoss = GETrue;
+                LogArenaQuests("before knock-out");
+                Hero.NPC.SetCurrentAttacker(Opponent);
+            }
+        }
+
+        return state;
+    }
+    void AfterDefeat(DefeatContext &state, Entity &Self, Entity &Hero)
+    {
+        using namespace ArenaJudge::Implementation;
+        auto &bThirdParty = state.bThirdParty;
+        auto &bForcedLoss = state.bForcedLoss;
+        auto &Opponent = state.Opponent;
+        if (bThirdParty)
+        {
+            // The native Defeat of the opponent has reported the "victory" to the quest manager; if the quest still runs
+            // (the status hook did not have to act), the loss is reported the way a consumable does it.
+            if (HasRunningArenaQuest())
+            {
+                Hero.NPC.SetCurrentAttacker(Self);
+                Entity World = Entity::GetWorldEntity();
+                World.QuestManager.OnNPCDefeated(Hero);
+            }
+            LogArenaQuests("opponent knocked out by a third party");
+            AnnounceLossToThirdParty();
+        }
+
+        if (bForcedLoss)
+        {
+            if (HasRunningArenaQuest())
+            {
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] The duel quest is still running after Defeat: "
+                                             "OnNPCDefeated is called by hand.\n");
+                Hero.NPC.SetCurrentAttacker(Opponent);
+                Entity World = Entity::GetWorldEntity();
+                World.QuestManager.OnNPCDefeated(Hero);
+            }
+            LogArenaQuests("after knock-out");
+            EndArenaFightOfOpponent(Opponent);
+            g_bDuelLossDone = GETrue; // done, the common end of the duel below must not repeat it
+            // v1.0.59.0: the artificial line "Бой проигран!" is removed: the loss is silent.
+        }
+        // After a violation of the arena rules the duel ends for everybody WHOEVER knocked the hero out - also when the
+        // opponent himself did it (the native code then did not stop him, he attacked the hero again after he got up).
+        if (Self == Hero && IsArenaPunishment() && !bForcedLoss)
+            EndArenaDuelAfterKnockout();
+    }
+    GEBool IsDuelTaboo(Entity &npc) { return ArenaJudge::Implementation::IsDuelTaboo(npc); }
+    GEBool IsWarnedOpponent(Entity &npc) { return ArenaJudge::Implementation::IsWarnedOpponent(npc); }
+    GEBool PreemptMagicWarning(Entity &npc) { return ArenaJudge::Implementation::PreemptMagicWarning(npc); }
+}
+
+namespace ArenaJudge::Combat
+{
+    GEInt FinishHeroDecision(Entity &Self, GEInt iResult)
+    {
+        using namespace ArenaJudge::Implementation;
         // v1.0.57.0: THE IRON IMMUNITY. The hero is down, in the animation of the fall or only rising: the answer is NO for
         // everybody, wherever the NPC stands and whatever the mercy / the arena / the attack reason are. It is lifted only by
         // UpdateHeroImmunity (the hero is up and in the routine PS_Normal_Loop / PS_Melee_Loop ...).
@@ -6866,7 +4119,7 @@ namespace RequirementsCheck
             if (s_iImmuneLines < 60)
             {
                 ++s_iImmuneLines;
-                GetDefaultLogger().LogFormat("[GenomeLogicFix][diag] '%s' asks whether to kill the hero: attack reason=%d, the hero "
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix][diag] '%s' asks whether to kill the hero: attack reason=%d, the hero "
                                              "is down / rising -> the plugin: NO\n",
                                              Self.GetName().GetText(), static_cast<int>(Self.NPC.AttackReason));
             }
@@ -6883,87 +4136,340 @@ namespace RequirementsCheck
         if (s_iAskLines < 120)
         {
             ++s_iAskLines;
-            GetDefaultLogger().LogFormat("[GenomeLogicFix][diag] '%s' asks whether to kill the hero: attack reason=%d, "
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix][diag] '%s' asks whether to kill the hero: attack reason=%d, "
                                          "mercy armed=%d, distance from the fall point=%.0f, arena fight=%d -> %s\n",
                                          Self.GetName().GetText(), static_cast<int>(Self.NPC.AttackReason),
-                                         static_cast<int>(g_bSpareArmed), static_cast<double>(fDistance),
+                                         static_cast<int>(IsArmed()), static_cast<double>(fDistance),
                                          static_cast<int>(bArenaFight),
                                          (bMercy || bArenaFight) ? "the plugin: NO" : "the plugin: leaves yes");
         }
         if (!bMercy && !bArenaFight)
             return iResult;
 
-        GetDefaultLogger().LogFormat("[GenomeLogicFix] '%s' does not finish the hero off (attack reason %d): he takes "
+        DebugLog::GetLogger().LogFormat("[GenomeLogicFix] '%s' does not finish the hero off (attack reason %d): he takes "
                                      "the weapon and the gold instead.\n",
                                      Self.GetName().GetText(), static_cast<int>(Self.NPC.AttackReason));
         return 0;
-    }
-
-    //
-    // WantToRansack(npc, hero): the NPC takes the weapon and the gold of the knocked-out hero. The native script refuses
-    // for a class Mage / Paladin, but the hero was robbed anyway after the mercy of the plugin. So the exception is
-    // enforced here: a Mage / Paladin (the hero or the NPC himself) is never ransacked while the mercy is applied.
-    //
-    ME_DEFINE_AND_HOOK_SCRIPT(WantToRansack)
-    {
-        GEInt const iResult = WantToRansack_Original(a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
-        Entity Self = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
-        Entity Other = ResolveEntity(a_pOtherEntity, a_pSPU->GetOtherEntity());
-        Entity Hero = Entity::GetPlayer();
-        // The creatures of the party never rob their fallen master.
-        if (IsMasterDownVictim(Self, Other))
-            return 0;
-        if (Self == None || Self == Hero || !(Other == Hero) || !Self.IsNPC())
-            return iResult;
-
-        gEClass const enuHeroClass = Hero.NPC.Class;
-        gEClass const enuNpcClass = Self.NPC.Class;
-        GEBool const bExempt = enuHeroClass == gEClass_Mage || enuHeroClass == gEClass_Paladin ||
-                               enuNpcClass == gEClass_Mage || enuNpcClass == gEClass_Paladin;
-        static GEInt s_iRansackLines = 0;
-        if (s_iRansackLines < 120)
-        {
-            ++s_iRansackLines;
-            GetDefaultLogger().LogFormat("[GenomeLogicFix][diag] '%s' (class %d) wants to ransack the hero (class %d): "
-                                         "native=%d -> %s\n",
-                                         Self.GetName().GetText(), static_cast<int>(enuNpcClass),
-                                         static_cast<int>(enuHeroClass), static_cast<int>(iResult),
-                                         (iResult && bExempt) ? "the plugin: NO (Mage / Paladin)" : "unchanged");
         }
-        return (iResult && bExempt) ? 0 : iResult;
+        void OnHeroSummonCast(GELPCChar a_strScript, gCScriptProcessingUnit *a_pSPU, GELPVoid a_pSelfEntity,
+                              GELPVoid a_pOtherEntity)
+        {
+            using namespace ArenaJudge::Implementation;
+
+            static GEBool s_bBusy = GEFalse;
+            if (s_bBusy)
+                return;
+            Entity Hero = Entity::GetPlayer();
+            Entity Self = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
+            Entity Other = ResolveEntity(a_pOtherEntity, a_pSPU->GetOtherEntity());
+            // The caster is the hero, or the hero is in his magic task (the script may run on the spell entity).
+            if (!(Self == Hero) && !(Other == Hero) && !IsHeroCasting(Hero))
+                return;
+            // v1.0.40.0: the punishment is given by the state tracker (PS_Magic_Summon / PS_Magic_QuickCast), not here: this
+            // hook only logs a summon cast inside the ring.
+            if (!HasRunningArenaQuest() || !IsHeroInsideArenaZone())
+                return; // no duel / outside the ring: summoning is free
+            static GEInt s_iLines = 0;
+            if (s_iLines < 60)
+            {
+                ++s_iLines;
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix][diag] arena: the hero casts a summon (%s, self='%s', "
+                                             "other='%s', last spell='%s') -> the crowd reacts at once\n",
+                                             a_strScript, Self != None ? Self.GetName().GetText() : "-",
+                                             Other != None ? Other.GetName().GetText() : "-",
+                                             bCString(Hero.NPC.LastSpell).GetText());
+            }
+            s_bBusy = GETrue;
+            s_bBusy = GEFalse;
+        }
+        GEBool IsHeroHealSpell(bCString const &a_strSpell, GEInt &o_iCastType, bCString &o_strHitFunc)
+        {
+            using namespace ArenaJudge::Implementation;
+
+            GEInt iSpellType = -1;
+            bCString strCastFunc;
+            GetSpellDamageType(a_strSpell, iSpellType, strCastFunc, &o_iCastType, &o_strHitFunc);
+            if (iSpellType < 0)
+                return GEFalse;
+            // The spells that replace a consumable: heal himself, cure poison, cure weakness (disease). The potions with
+            // these effects are forbidden in the arena as well. MagicHealOther is NOT in the list.
+            return (_stricmp(o_strHitFunc.GetText(), "MagicHeal") == 0 ||
+                    _stricmp(o_strHitFunc.GetText(), "MagicCurePoison") == 0 ||
+                    _stricmp(o_strHitFunc.GetText(), "MagicCureDisease") == 0) &&
+                   o_iCastType == static_cast<GEInt>(gECastType_Regular);
+        }
+
+        void OnHeroHealCast(GELPCChar a_strScript, gCScriptProcessingUnit *a_pSPU, GELPVoid a_pSelfEntity)
+        {
+            using namespace ArenaJudge::Implementation;
+
+            Entity Hero = Entity::GetPlayer();
+            Entity Self = ResolveEntity(a_pSelfEntity, a_pSPU->GetSelfEntity());
+            // The hero casts it himself (his magic task; a potion is PS_MagicPotion and is handled by the consumable hook).
+            if (!(Self == Hero) || !IsHeroCasting(Hero))
+                return;
+            // v1.0.40.0: with a Running arena quest and the hero in the ring the magic is judged by the state tracker (the
+            // cast state is the punishment, for every spell). The old consumable rule below only covers a duel without quest.
+            if (HasRunningArenaQuest() && IsHeroInsideArenaZone())
+                return;
+            if (!IsArenaFightStarted() || !IsHeroInsideArenaZone())
+                return;
+            GEInt iCastType = -1;
+            bCString strHitFunc;
+            bCString const strSpell = Hero.NPC.LastSpell;
+            GEBool const bHeal = IsHeroHealSpell(strSpell, iCastType, strHitFunc);
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix][diag] arena: the hero casts %s (spell '%s', cast type=%d, "
+                                         "hit script '%s') -> %s\n",
+                                         a_strScript, strSpell.GetText(), static_cast<int>(iCastType),
+                                         strHitFunc.GetText(),
+                                         bHeal ? "a heal / cure like a consumable" : "left alone (fast variant / unknown)");
+            if (bHeal)
+                OnHeroConsumeStarted();
+        }
+}
+
+namespace ArenaJudge::Loops
+{
+        // True: the NPC was handled (the attack was dropped), the native loop must not run in this tick.
+        GEBool FixStaleHeroTarget(Entity &a_Npc)
+        {
+            using namespace ArenaJudge::Implementation;
+
+            if (a_Npc == None || !a_Npc.IsNPC())
+                return GEFalse;
+            Entity Target = a_Npc.NPC.GetCurrentTarget();
+            Entity Player = Entity::GetPlayer();
+            GEBool bStale = GEFalse;
+            if (Target != None)
+            {
+                // The removed body of the hero: it is not the player any more (the beast is).
+                bCString const strTarget = Target.GetName();
+                bStale = !(Target == Player) && strTarget.GetText() != nullptr && _stricmp(strTarget.GetText(), "PC_Hero") == 0;
+            }
+            else
+            {
+                // No target at all, but the plugin sent him against the hero (the crime): the target is lost. v1.0.67.0: only while the
+                // hero is in a form (or the form is awaited): after a knock-out or a normal end of a fight an empty target is the native
+                // end of the attack and is not repaired.
+                if (IsHeroKnockedOut() || !(g_bFormAggroPending || IsHeroTransformedNow()))
+                    return GEFalse;
+                bStale = FindAggro(a_Npc.GetName()) >= 0 && a_Npc.NPC.AttackReason != gEAttackReason_None;
+            }
+            if (!bStale)
+                return GEFalse;
+
+            static GEInt s_iLines = 0;
+            if (Player != None && !Player.IsDead())
+            {
+                a_Npc.NPC.SetCurrentTarget(Player);
+                if (s_iLines < 30)
+                {
+                    ++s_iLines;
+                    DebugLog::GetLogger().LogFormat("[GenomeLogicFix] ZS_Attack_Loop: '%s' had the removed body of the hero as the target - "
+                                                 "he is aimed at the current body of the hero '%s'.\n",
+                                                 a_Npc.GetName().GetText(), Player.GetName().GetText());
+                }
+                return GEFalse;
+            }
+            a_Npc.Routine.FullStop();
+            a_Npc.NPC.SetCurrentTarget(None);
+            a_Npc.NPC.AttackReason = gEAttackReason_None;
+            a_Npc.Routine.ContinueRoutine();
+            if (s_iLines < 30)
+            {
+                ++s_iLines;
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] ZS_Attack_Loop: '%s' has no body of the hero to attack - the attack is "
+                                             "dropped.\n",
+                                             a_Npc.GetName().GetText());
+            }
+            return GETrue;
+        }
+    GEBool ReleaseInvalidPunishmentTarget(gCScriptProcessingUnit *a_pSPU)
+    {
+        using namespace ArenaJudge::Implementation;
+        {
+            Entity Fighter(a_pSPU->GetSelfEntity());
+            Entity target = Fighter != None && Fighter.IsNPC() ? Fighter.NPC.GetCurrentTarget() : Entity();
+            if (IgnoreArenaPunishmentTarget(Fighter, target))
+            {
+                LogArenaPunishmentFilter(Fighter, target, "ZS_Attack_Loop");
+                Fighter.Routine.FullStop();
+                Fighter.NPC.SetCurrentTarget(None);
+                Fighter.NPC.SetAlternativeTarget(None);
+                Fighter.NPC.AttackReason = gEAttackReason_None;
+                Fighter.NPC.CombatState = 0;
+                if (IsHeroControlled(Fighter))
+                    Fighter.Routine.SetTask(Fighter.Party.Waiting ? "ZS_WaitForPlayer" : "ZS_FollowPlayer");
+                else
+                    Fighter.Routine.ContinueRoutine();
+                return GETrue;
+            }
+        }
+        return GEFalse;
+    }
+    GEBool ReleaseProtectedPartyTarget(gCScriptProcessingUnit *a_pSPU)
+    {
+        using namespace ArenaJudge::Implementation;
+        {
+            Entity Gladiator(a_pSPU->GetSelfEntity());
+            Entity GTarget = Gladiator != None ? Gladiator.NPC.GetCurrentTarget() : Entity();
+            if (Gladiator != None && GTarget != None && IsHeroControlled(GTarget) && IsDuelTaboo(Gladiator))
+            {
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] The duel opponent '%s' leaves '%s' (party of the hero) alone.\n",
+                                             Gladiator.GetName().GetText(), GTarget.GetName().GetText());
+                Gladiator.Routine.FullStop();
+                Gladiator.NPC.SetCurrentTarget(None);
+                Gladiator.NPC.SetCurrentAttacker(None);
+                Gladiator.NPC.AttackReason = gEAttackReason_None;
+                Gladiator.Routine.ContinueRoutine();
+                return GETrue;
+            }
+        }
+        return GEFalse;
     }
 
-    //
-    // Stage 4: no difficulty speed-up of the arena opponent. The animation speed of an NPC is set through
-    // Entity::SetTimeScale / PSRoutine::SetTimeScale (Script.dll). During an arena fight a value above 1.0 for the
-    // opponent is replaced by the base speed 1.0. A value below 1.0 (weakness slows the NPC down, freezing sets 0) is
-    // never touched, so a weakened opponent is honestly slowed. (Game 1.8.7 has no gECharacterState_Weak enum.)
-    //
-    namespace
+    void PollCompanions()
     {
-        GEFloat ClampOpponentTimeScale(eCEntity *a_pOwner, GEFloat a_fScale)
-        {
-            // v1.0.59.0: EnableHardDifficultyAttackSpeed=true: the native speed-up of the arena opponent returns (no clamp).
-            if (g_Config.EnableHardDifficultyAttackSpeed || a_fScale <= 1.0f || !a_pOwner)
-                return a_fScale;
-            Entity Owner(a_pOwner);
+        ArenaJudge::Implementation::CheckArenaCompanions();
+        ArenaJudge::Implementation::TrackDuelForCompanions();
+    }
+
+    GEBool HoldWarning(Entity &npc)
+    {
+        return ArenaJudge::Implementation::PreemptMagicWarning(npc) || ArenaJudge::Implementation::HoldOpponentInWarning(npc);
+    }
+}
+
+namespace ArenaJudge::ConflictHooks
+{
+    GEBool IsFormTransitionPending() { return ArenaJudge::Implementation::g_bFormAggroPending; }
+    void ResetBeforeMercy()
+    {
+        ArenaJudge::Implementation::ResetFormAggro();
+        ArenaJudge::Punishment::g_strStage2Hold = bCString();
+        ArenaJudge::Implementation::g_bOverLineSaid = GEFalse;
+        ArenaJudge::Implementation::g_bOverLinePending = GEFalse;
+    }
+    void ResetDuelLoss() { ArenaJudge::Implementation::g_bDuelLossDone = GEFalse; }
+    void ClearWitnesses() { ArenaJudge::Punishment::g_iArenaWitnessCount = 0; }
+    void EndDuelAfterKnockout() { ArenaJudge::Implementation::EndArenaDuelAfterKnockout(); }
+}
+
+namespace ArenaJudge::Loops
+{
+    void OnHeroTeleported()
+    {
+        ArenaJudge::Implementation::CancelAbandonedArena("confirmed hero teleport", GEFalse);
+    }
+}
+
+namespace ArenaJudge::Native
+{
+    void OnHeroAttackerSet(PSNpc *npc, Entity const *attacker, GELPCChar where)
+    { ArenaJudge::Implementation::OnHeroAttackerSet(npc, attacker, where); }
+    void NpcEnableStatusEffects(PSNpc *a_pThis, GEInt a_iMask, GEBool a_bEnable, NpcEnableStatusEffectsOriginal original)
+    {
+        using namespace ArenaJudge::Implementation;
+
+            using mFOriginal = void(GE_STDCALL *)(PSNpc *, GEInt, GEBool);
+            GEBool const bWatched = a_pThis && a_bEnable && (a_iMask & 3) != 0 && a_pThis->m_pEngineEntityPropertySet;
+            GEBool const bWasBurning = bWatched && (a_iMask & 1) ? a_pThis->IsBurning() : GEFalse;
+            GEBool const bWasFrozen = bWatched && (a_iMask & 2) ? a_pThis->IsFrozen() : GEFalse;
+
+            original(a_pThis, a_iMask, a_bEnable);
+
+            static GEBool s_bBusy = GEFalse; // the witnesses' AssessTarget must not re-enter
+            if (!bWatched || s_bBusy)
+                return;
+            GEBool const bBurningStarted = (a_iMask & 1) && !bWasBurning && a_pThis->IsBurning();
+            GEBool const bFrozenStarted = (a_iMask & 2) && !bWasFrozen && a_pThis->IsFrozen();
+            if (!bBurningStarted && !bFrozenStarted)
+                return;
+
+            eCEntity *pOwner = static_cast<eCEntityPropertySet *>(a_pThis->m_pEngineEntityPropertySet)->GetEntity();
+            if (!pOwner)
+                return;
+            Entity Victim(pOwner);
+            Entity Hero = Entity::GetPlayer();
             Entity Opponent;
-            if (FindArenaOpponent(Opponent) && Owner == Opponent)
-                return 1.0f;
-            return a_fScale;
-        }
+            if (Victim == Hero || !FindArenaOpponent(Opponent) || !(Victim == Opponent))
+                return;
+            if (IsHeroDuelBlocked())
+                return; // v1.0.48.0: the hero in a monster body: no duel judging, the original already ran
+            if (!IsHeroInsideArenaZone())
+            {
+                LogOutsideRing("setting the opponent on fire / freezing him");
+                return;
+            }
+            // v1.0.52.0: AllowArenaEnchantedWeapons: the status of a fire / ice SWORD (no cast, no shot) is no violation.
+            if (IsEnchantedMeleeEffect())
+            {
+                static GEInt s_iEnchantedLines = 0;
+                if (s_iEnchantedLines < 40)
+                {
+                    ++s_iEnchantedLines;
+                    DebugLog::GetLogger().LogFormat("[GenomeLogicFix][diag] arena: %s started on '%s' by an enchanted melee weapon "
+                                                 "(AllowArenaEnchantedWeapons=true): allowed, the melee duel goes on.\n",
+                                                 bBurningStarted ? "BURNING" : "FREEZING", Victim.GetName().GetText());
+                }
+                return;
+            }
 
-        // gCSession::Start(mode) / gCSession::Stop() (Game.dll): a save game is loaded (mode LoadGame = 1) or a new game
-        // starts (mode NewGame = 0) / the session ends. The state of the beating lives in the plugin only, so it is
-        // forgotten here, before the original runs (the original also stops a running session itself).
-        // v1.0.60.0: GUI2::PrintGameMessage (Script.dll). The native end of the arena (ZS_Arena_Loop / ZS_Attack_Loop: the hero left the
-        // ring) says the line "YouLeftTheArena" and prints the text GO_ArenaWarning with the message type Failure (13; disassembly of
-        // Script_Game.dll 1.8.7: push 0Dh before the call). While the plaque is blocked (the voice of the end of the arena is heard
-        // instead of it: the cancelled duel, the voice over the fallen hero) a Failure message is swallowed; every other message and every
-        // message outside the window passes untouched. The plugin itself prints no Failure message any more.
-        mCFunctionHook Hook_GuiPrintGameMessage;
-        void GE_STDCALL GuiPrintGameMessage(GUI2 *a_pThis, bCUnicodeString const *a_pText, gEGameMessageType a_enuType)
-        {
+            // Only the hero can set the opponent on fire / freeze him in the arena. If somebody else is already written
+            // down as the attacker, it is not the hero's doing.
+            Entity Attacker = Victim.NPC.GetLastAttacker();
+            Entity Current = Victim.NPC.GetCurrentAttacker();
+            GEBool const bOther = (Attacker != None && !(Attacker == Hero)) || (Current != None && !(Current == Hero));
+            static GEInt s_iStatusLines = 0;
+            if (s_iStatusLines < 100)
+            {
+                ++s_iStatusLines;
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix][diag] arena: %s started on '%s' (last attacker '%s', "
+                                             "current attacker '%s', last spell '%s') -> %s\n",
+                                             bBurningStarted ? "BURNING" : "FREEZING", Victim.GetName().GetText(),
+                                             Attacker != None ? Attacker.GetName().GetText() : "-",
+                                             Current != None ? Current.GetName().GetText() : "-",
+                                             bCString(Hero.NPC.LastSpell).GetText(),
+                                             bOther ? "not the hero, ignored" : "the crowd reacts at once");
+            }
+            if (bOther)
+                return;
+
+            s_bBusy = GETrue;
+            DeclareHeroCriminal(bBurningStarted ? "the arena opponent was set on fire"
+                                                : "the arena opponent was frozen",
+                                GETrue);
+            s_bBusy = GEFalse;
+            }
+    void NpcSetLastCast(PSNpc *a_pThis, NpcSetLastCastOriginal original)
+    {
+        using namespace ArenaJudge::Implementation;
+
+            using mFOriginal = void(GE_STDCALL *)(PSNpc *);
+            original(a_pThis);
+            if (!a_pThis || !a_pThis->m_pEngineEntityPropertySet)
+                return;
+            eCEntity *pOwner = static_cast<eCEntityPropertySet *>(a_pThis->m_pEngineEntityPropertySet)->GetEntity();
+            if (pOwner && Entity(pOwner) == Entity::GetPlayer())
+            {
+                g_u32HeroCastTick = ::GetTickCount();
+                if (g_u32HeroCastTick == 0)
+                    g_u32HeroCastTick = 1;
+                ++g_u32HeroCastSeq;
+                LogMagicAim("SetLastCast after native update");
+                static GEInt s_iCastLines = 0;
+                if (s_iCastLines < 30)
+                {
+                    ++s_iCastLines;
+                    bCString const strSpell = Entity::GetPlayer().NPC.LastSpell;
+                    DebugLog::GetLogger().LogFormat("[GenomeLogicFix][diag] hero cast '%s'\n", strSpell.GetText());
+                }
+            }
+            }
+    void GuiPrintGameMessage(GUI2 *a_pThis, bCUnicodeString const *a_pText, gEGameMessageType a_enuType, GuiPrintGameMessageOriginal original)
+    {
+        using namespace ArenaJudge::Implementation;
+
             using mFOriginal = void(GE_STDCALL *)(GUI2 *, bCUnicodeString const *, gEGameMessageType);
             if (a_enuType == gEGameMessageType_Failure && g_u32PlaqueBlockUntil != 0 &&
                 static_cast<GEInt>(::GetTickCount() - g_u32PlaqueBlockUntil) < 0)
@@ -6972,168 +4478,81 @@ namespace RequirementsCheck
                 if (s_iLines < 20)
                 {
                     ++s_iLines;
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix] The native plaque of the end of the arena (Failure) is blocked: "
+                    DebugLog::GetLogger().LogFormat("[GenomeLogicFix] The native plaque of the end of the arena (Failure) is blocked: "
                                                  "only the voice is heard.\n");
                 }
                 return;
             }
-            Hook_GuiPrintGameMessage.GetOriginalFunction<mFOriginal>()(a_pThis, a_pText, a_enuType);
-        }
+            original(a_pThis, a_pText, a_enuType);
+            }
+    void EntitySetTimeScale(Entity *a_pThis, GEFloat a_fScale, EntitySetTimeScaleOriginal original)
+    {
+        using namespace ArenaJudge::Implementation;
 
-        void ClearStaleSessionHero(gCSession *a_pSession); // v1.0.67.0: defined below, next to SessionStop
-
-        mCFunctionHook Hook_SessionStart;
-        void GE_STDCALL SessionStart(gCSession *a_pThis, gESession_StartMode a_enuMode)
-        {
-            using mFOriginal = void(GE_STDCALL *)(gCSession *, gESession_StartMode);
-            // v1.0.55.0: the three marks tell, from the log alone, WHERE a hang of the loading is: before the reset (the plugin is not
-            // reached at all), inside the original gCSession::Start (the game itself / another plugin), or after it.
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Session start (mode %d): entering.\n", static_cast<int>(a_enuMode));
-            ResetCityState(a_enuMode == gESession_StartMode_LoadGame ? "a save game is loaded" : "a new game starts");
-            ClearStaleSessionHero(a_pThis); // v1.0.67.0: a hero pointer left by a session that did not pass through Stop
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Session start: the original gCSession::Start is called.\n");
-            Hook_SessionStart.GetOriginalFunction<mFOriginal>()(a_pThis, a_enuMode);
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Session start: the original returned, the world is up.\n");
-            // v1.1.1.0: after a LOAD the waiting companions of a duel that was Running in the save are looked up once the quests are there
-            // (PollSessionAdopt, from TrackDuelForCompanions). A new game has no such state. Only a flag is set here: nothing of the game is called.
-            if (a_enuMode == gESession_StartMode_LoadGame)
-                ArmArenaAdoptAfterLoad();
-        }
-
-        //
-        // v1.0.67.0: THE CRASH ON THE RELOAD OF A SAVE GAME AFTER A TRANSFORMATION (ge3log8 / 9 / 12 + the CrashDiag report: always the same
-        // stack and the same dead pointer 0xEC1A7C10). gCSession::GetHero() (Game.dll 1.8.7) is "return [session+0x24] ? [session+0x24] :
-        // [session+0x1C]". The transformation puts the real body of the hero (PC_Hero) into +0x24 and the form into +0x1C (the player).
-        // gCSession::Stop zeroes +0x1C and +0x20 but NOT +0x24, and the new session (Start -> CreatePlayerEntity) writes only +0x1C. So after
-        // the reload GetHero() keeps returning the removed PC_Hero of the previous world - a destroyed eCEntity (its vtable is already the
-        // base-class one: SharedBase.dll+0x8D194, the slot 0xA0 is empty). Script_QuickLoot.dll builds an Entity from GetHero() in the tick
-        // of every NPC: Entity(eCEntity const *) -> AttachTo -> call [vtable+0xA0] = a jump to address 0 (EIP=0 in the crash log).
-        // The plugin is not what reads the dead pointer; it clears it where the engine forgot to: right after Stop, and only when the layout
-        // is the one that was verified (the machine code of GetHero is compared byte by byte).
-        //
-        GEBool VerifyGetHeroLayout()
-        {
-            static GEInt s_iState = 0; // 0: not checked, 1: the layout is the verified one, -1: it is not (nothing is touched then)
-            if (s_iState != 0)
-                return s_iState > 0 ? GETrue : GEFalse;
-            static GEU8 const arrExpected[] = {0x8B, 0x41, 0x24, 0x85, 0xC0, 0x75, 0x03, 0x8B, 0x41, 0x1C, 0xC3};
-            HMODULE const hGame = ::GetModuleHandleA("Game.dll");
-            GEU8 const *pCode = hGame ? reinterpret_cast<GEU8 const *>(
-                                            ::GetProcAddress(hGame, "?GetHero@gCSession@@QAEPAVeCDynamicEntity@@XZ"))
-                                      : nullptr;
-            s_iState = pCode && memcmp(pCode, arrExpected, sizeof(arrExpected)) == 0 ? 1 : -1;
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] gCSession::GetHero layout check: %s.\n",
-                                         s_iState > 0 ? "as verified (the stale hero pointer of the stopped session can be cleared)"
-                                                      : "DIFFERENT - the stale hero pointer of the stopped session is not touched");
-            return s_iState > 0 ? GETrue : GEFalse;
-        }
-
-        void ClearStaleSessionHero(gCSession *a_pSession)
-        {
-            if (!a_pSession || !VerifyGetHeroLayout())
-                return;
-            GEU32 volatile *pPlayer = reinterpret_cast<GEU32 volatile *>(reinterpret_cast<GEU8 *>(a_pSession) + 0x1C);
-            GEU32 volatile *pHero = reinterpret_cast<GEU32 volatile *>(reinterpret_cast<GEU8 *>(a_pSession) + 0x24);
-            // Stop has cleared the player (+0x1C); a hero pointer that is still there belongs to the world that was just destroyed.
-            if (*pPlayer != 0 || *pHero == 0)
-                return;
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Session stop: the session still points to the hero body 0x%08X of the destroyed "
-                                         "world (a transformation was active) - the pointer is cleared.\n",
-                                         static_cast<unsigned>(*pHero));
-            *pHero = 0;
-        }
-
-        mCFunctionHook Hook_SessionStop;
-        void GE_STDCALL SessionStop(gCSession *a_pThis)
-        {
-            using mFOriginal = void(GE_STDCALL *)(gCSession *);
-            ResetCityState("the session stops");
-            Hook_SessionStop.GetOriginalFunction<mFOriginal>()(a_pThis);
-            ClearStaleSessionHero(a_pThis);
-        }
-
-        mCFunctionHook Hook_EntitySetTimeScale;
-        void GE_STDCALL EntitySetTimeScale(Entity *a_pThis, GEFloat a_fScale)
-        {
             using mFOriginal = void(GE_STDCALL *)(Entity *, GEFloat);
-            Hook_EntitySetTimeScale.GetOriginalFunction<mFOriginal>()(
+            original(
                 a_pThis, ClampOpponentTimeScale(a_pThis ? a_pThis->GetInstance() : nullptr, a_fScale));
-        }
+            }
+    void RoutineSetTimeScale(PSRoutine *a_pThis, GEFloat a_fScale, RoutineSetTimeScaleOriginal original)
+    {
+        using namespace ArenaJudge::Implementation;
 
-        mCFunctionHook Hook_RoutineSetTimeScale;
-        void GE_STDCALL RoutineSetTimeScale(PSRoutine *a_pThis, GEFloat a_fScale)
-        {
             using mFOriginal = void(GE_STDCALL *)(PSRoutine *, GEFloat);
             eCEntity *pOwner = a_pThis ? static_cast<eCEntityPropertySet *>(a_pThis->m_pEngineEntityPropertySet)->GetEntity() : nullptr;
-            Hook_RoutineSetTimeScale.GetOriginalFunction<mFOriginal>()(a_pThis, ClampOpponentTimeScale(pOwner, a_fScale));
-        }
+            original(a_pThis, ClampOpponentTimeScale(pOwner, a_fScale));
+            }
+    GEBool NpcCanHit(PSNpc *a_pThis, GEU32 a_u32MinDuration, NpcCanHitOriginal original)
+    {
+        using namespace ArenaJudge::Implementation;
 
-        // PSParty::GetPartyLeader (Script.dll): THE PARTY FOLLOWS THE MASTER IN ANY FORM. A transformation (scroll,
-        // potion) makes a separate creature the player (Entity::GetPlayer()), while the party of the hero stays bound to
-        // his own human body "PC_Hero", which is hidden meanwhile. Every native check "the leader is the player" (follow
-        // state, the blue name in the group, "is a companion") then fails: the companions turn grey, drop out of the
-        // group and stop following. Here the leader that is the hidden body PC_Hero is reported as the player, but only
-        // for a creature that really belongs to the party (types 1..5); the body itself and strangers are untouched.
-        mCFunctionHook Hook_PartyGetLeader;
-        Entity *GE_STDCALL PartyGetLeader(PSParty *a_pThis, Entity *a_pRet)
-        {
-            using mFOriginal = Entity *(GE_STDCALL *)(PSParty *, Entity *);
-            Entity *pResult = Hook_PartyGetLeader.GetOriginalFunction<mFOriginal>()(a_pThis, a_pRet);
-            if (!a_pRet || !a_pThis || !a_pThis->m_pEngineEntityPropertySet || a_pRet->GetInstance() == nullptr)
-                return pResult;
-            Entity Hero = Entity::GetPlayer();
-            if (Hero == None || *a_pRet == Hero)
-                return pResult;
-            if (_stricmp(a_pRet->GetName().GetText(), "PC_Hero") != 0)
-                return pResult; // the leader is somebody else: nothing to fix
-            if (_stricmp(Hero.GetName().GetText(), "PC_Hero") == 0)
-                return pResult; // the hero is in his own body
-            eCEntity *pOwner = static_cast<eCEntityPropertySet *>(a_pThis->m_pEngineEntityPropertySet)->GetEntity();
-            if (!pOwner)
-                return pResult;
-            Entity Owner(pOwner);
-            if (Owner == Hero || _stricmp(Owner.GetName().GetText(), "PC_Hero") == 0 || !Owner.IsNPC() ||
-                Owner.Party.PartyMemberType == gEPartyMemberType_None)
-                return pResult;
-            *a_pRet = Hero;
-            return a_pRet;
-        }
-
-        // PSNpc::CanHit(minDuration) (Script.dll): may the NPC hit now? minDuration is MinHitDuration of ge3.ini (the
-        // callers pass it); the answer is "enough time has passed since the last hit". The native function skips the whole
-        // delay for an NPC whose attack reason is Arena (0x12) (and for a zombie), on every difficulty, so the arena
-        // opponent attacked without any pause. For the time of the call the reason Arena is hidden behind Duel (0x11, which
-        // CanHit does not know), so the opponent keeps the delay of the ini like every other NPC, and it is put back at
-        // once. Nothing else reads the reason inside this call.
-        mCFunctionHook Hook_NpcCanHit;
-        GEBool GE_STDCALL NpcCanHit(PSNpc *a_pThis, GEU32 a_u32MinDuration)
-        {
             using mFOriginal = GEBool(GE_STDCALL *)(PSNpc *, GEU32);
             eCEntity *pOwner = a_pThis && a_pThis->m_pEngineEntityPropertySet
                                    ? static_cast<eCEntityPropertySet *>(a_pThis->m_pEngineEntityPropertySet)->GetEntity()
                                    : nullptr;
             // v1.0.59.0: DisableMinHitDurationOnHard=true: the native "no pause between the blows" of the arena opponent returns.
-            if (pOwner && !g_Config.DisableMinHitDurationOnHard)
+            if (pOwner && !GetConfig().DisableMinHitDurationOnHard)
             {
                 Entity Owner(pOwner);
                 if (Owner.IsNPC() && Owner.NPC.AttackReason == gEAttackReason_Arena)
                 {
                     Owner.NPC.AttackReason = gEAttackReason_Duel;
-                    GEBool const bResult = Hook_NpcCanHit.GetOriginalFunction<mFOriginal>()(a_pThis, a_u32MinDuration);
+                    GEBool const bResult = original(a_pThis, a_u32MinDuration);
                     Owner.NPC.AttackReason = gEAttackReason_Arena;
                     return bResult;
                 }
             }
-            return Hook_NpcCanHit.GetOriginalFunction<mFOriginal>()(a_pThis, a_u32MinDuration);
-        }
-
-        // gCQuest_PS::SetStatus(gEQuestStatus const &) (Game.dll, called directly by OnNPCDefeated and the dialogue
-        // scripts). When the opponent of the duel was knocked out by somebody who is not the hero, the quest of the arena
-        // must not become Success / Won: it becomes Lost (the status that also switches the arena off). Every other
-        // quest and every other status pass through untouched. This is the hook that worked in the first versions.
-        mCFunctionHook Hook_QuestSetStatus;
-        GEBool GE_STDCALL QuestSetStatus(gCQuest_PS *a_pThis, gEQuestStatus const *a_penuStatus)
+            return original(a_pThis, a_u32MinDuration);
+            }
+    GEBool ClearNewArenaAttemptCounters(gCQuest_PS *quest, gEQuestStatus const *requested,
+                                        bTValArray<GEI32> &saved)
+    {
+        if (!quest || !requested || quest->GetType() != gEQuestType_Arena ||
+            *requested != gEQuestStatus_Running ||
+            (quest->GetStatus() != gEQuestStatus_Open && quest->GetStatus() != gEQuestStatus_Lost))
+            return GEFalse;
+        auto &counters = quest->AccessDeliveryCounter();
+        auto const &targets = quest->GetDeliveryEntities();
+        if (counters.GetCount() != targets.GetCount() ||
+            counters.GetCount() != quest->GetDeliveryAmounts().GetCount())
         {
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix][arena-attempt] '%s': counter/target sizes differ; reset skipped.\n",
+                quest->GetName().GetText());
+            return GEFalse;
+        }
+        saved = counters;
+        for (GEInt i = 0; i < counters.GetCount(); ++i)
+        {
+            DebugLog::GetLogger().LogFormat("[GenomeLogicFix][arena-attempt] '%s': target[%d]='%s' progress %d -> 0 for new attempt.\n",
+                quest->GetName().GetText(), i, targets[i].GetText(), counters[i]);
+            counters[i] = 0;
+        }
+        return GETrue;
+    }
+
+    GEBool QuestSetStatus(gCQuest_PS *a_pThis, gEQuestStatus const *a_penuStatus, QuestSetStatusOriginal original, GELPVoid caller)
+    {
+        using namespace ArenaJudge::Implementation;
+
             using mFOriginal = GEBool(GE_STDCALL *)(gCQuest_PS *, gEQuestStatus const *);
             // v1.0.43.0 diagnostics: every status change of an arena quest, with the state of the hero (who restarts the duel
             // quest after the ransack shows up here).
@@ -7143,466 +4562,70 @@ namespace RequirementsCheck
                 if (s_iStatusLines < 80)
                 {
                     ++s_iStatusLines;
-                    GetDefaultLogger().LogFormat("[GenomeLogicFix][diag] arena quest '%s': SetStatus(%d), now %d, hero down=%d, "
+                    DebugLog::GetLogger().LogFormat("[GenomeLogicFix][diag] arena quest '%s': SetStatus(%d), now %d, hero down=%d, "
                                                  "mercy armed=%d active=%d, caller %p\n",
                                                  a_pThis->GetName().GetText(), static_cast<int>(*a_penuStatus),
                                                  static_cast<int>(a_pThis->GetStatus()), static_cast<int>(IsHeroKnockedOut()),
-                                                 static_cast<int>(g_bSpareArmed), static_cast<int>(g_bSpareActive),
-                                                 _ReturnAddress());
+                                                 static_cast<int>(IsArmed()), static_cast<int>(IsFallActive()),
+                                                 caller);
                 }
             }
             if (a_pThis && a_penuStatus && g_bLostToThirdParty &&
                 (*a_penuStatus == gEQuestStatus_Success || *a_penuStatus == gEQuestStatus_Won) &&
                 a_pThis->GetType() == gEQuestType_Arena)
             {
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] duel quest '%s': status %d replaced with Lost (the opponent "
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix] duel quest '%s': status %d replaced with Lost (the opponent "
                                              "was not beaten by the hero).\n",
                                              a_pThis->GetName().GetText(), static_cast<int>(*a_penuStatus));
                 gEQuestStatus const enuLost = gEQuestStatus_Lost;
-                GEBool const bResult = Hook_QuestSetStatus.GetOriginalFunction<mFOriginal>()(a_pThis, &enuLost);
+                GEBool const bResult = original(a_pThis, &enuLost);
                 AnnounceLossToThirdParty();
                 return bResult;
             }
             GEBool const bWasLost = a_pThis && a_pThis->GetStatus() == gEQuestStatus_Lost ? GETrue : GEFalse; // v1.0.68.0
-            GEBool const bSetResult = Hook_QuestSetStatus.GetOriginalFunction<mFOriginal>()(a_pThis, a_penuStatus);
-            if (a_pThis && a_penuStatus && *a_penuStatus == gEQuestStatus_Running &&
-                a_pThis->GetType() == gEQuestType_Arena)
+            bTValArray<GEI32> savedCounters;
+            GEBool const bCleared = ClearNewArenaAttemptCounters(a_pThis, a_penuStatus, savedCounters);
+            GEBool const bSetResult = original(a_pThis, a_penuStatus);
+            if (bCleared && !bSetResult)
+            {
+                a_pThis->AccessDeliveryCounter() = savedCounters;
+                DebugLog::GetLogger().LogFormat("[GenomeLogicFix][arena-attempt] '%s': start rejected; counters restored.\n",
+                    a_pThis->GetName().GetText());
+            }
+            if (bSetResult && a_pThis && a_penuStatus && *a_penuStatus == gEQuestStatus_Running &&
+                a_pThis->GetStatus() == gEQuestStatus_Running && a_pThis->GetType() == gEQuestType_Arena)
                 OnArenaQuestStarted(bWasLost); // the dialogue with the master of the arena: the companions wait NOW
             return bSetResult;
-        }
-
-        // Entity::DoDamage(source, amount, type) (Script.dll): the damage dealt by script code directly, bypassing
-        // DoLogicalDamage - the area spells (MagicAreaDamageTick: meteor, fire rain, hail ...) use it for every victim of
-        // the explosion. It is a thin wrapper: it forwards (source, 0, amount, type, 0, iterator) to the virtual
-        // gCEntity::DoDamage of the entity "this". The check below is symmetric (both sides must be under the control of
-        // the hero), so it does not matter which side is which. The source is the owner of the spell (the chain of owners
-        // is followed by GetDamageOwnerNpc). Blocked: the call is not forwarded at all, so no damage is done.
-        mCFunctionHook Hook_EntityDoDamage;
-        void GE_STDCALL EntityDoDamage(Entity *a_pThis, Entity const *a_pSource, GEU32 a_u32Amount,
-                                       gEDamageType a_enuType)
-        {
-            using mFOriginal = void(GE_STDCALL *)(Entity *, Entity const *, GEU32, gEDamageType);
-            if (a_pThis && a_pSource && a_pThis->GetInstance() && a_pSource->GetInstance())
-            {
-                Entity Victim(*a_pThis);
-                Entity Source(*a_pSource);
-                Entity Attacker = GetDamageOwnerNpc(Source);
-                LogArmyHit("Entity::DoDamage (area / scripted damage)", Victim, Source, static_cast<GEInt>(a_enuType));
-                if (IsFriendlyFire(Attacker, Victim, GETrue))
-                {
-                    ZeroPendingDamage(Victim);
-                    return; // no friendly fire inside the army of the hero (also area spells): the damage is 0
-                }
-                // While the hero is knocked out nothing of his party hurts him (the damage is equal to zero).
-                if (Attacker != None && IsHeroSide(Victim) && IsHeroControlled(Attacker) && IsHeroKnockedOut())
-                    return;
             }
-            Hook_EntityDoDamage.GetOriginalFunction<mFOriginal>()(a_pThis, a_pSource, a_u32Amount, a_enuType);
-        }
-
-        // The animation speed of the arena opponent on the hard difficulty. The script function that returns the animation
-        // speed of an NPC (Script_Game.dll 1.8.7, RVA 0x42A0, called by every _AI_*Attack / parade / stumble) ends with
-        //   if (attackReason == Arena && GetCurrentDifficulty() == Hard) speed *= 1.25;
-        // i.e. at RVA 0x4DB6 "cmp eax,12h / jne", at 0x4DB8 "call GetCurrentDifficulty", at 0x4DBE "cmp eax,2" and at 0x4DC1
-        // "jne 0x4DE3" (skip the multiplication). Only this ONE place is touched: the conditional jump becomes an
-        // unconditional one (75 -> EB, the same distance), so for the arena opponent the multiplication is never done, and
-        // the speed stays what it is on the medium difficulty. The base speed, the weakness slow-down (x0.75, a few
-        // instructions above) and every other difficulty rule are untouched. All bytes are checked before the write; on any
-        // other build of Script_Game.dll nothing is patched.
-        void RemoveArenaHardSpeedUp()
-        {
-            HMODULE hModule = ::GetModuleHandleA("Script_Game.dll");
-            if (!hModule)
-            {
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Script_Game.dll is not loaded: the arena speed-up of the "
-                                             "hard difficulty is left as it is.\n");
-                return;
-            }
-            GEU8 *pBase = reinterpret_cast<GEU8 *>(hModule);
-            // Bytes 2..5 are the ABSOLUTE address of the import slot of GetCurrentDifficulty. The DLL is not loaded at its
-            // preferred base (the crash log of the game shows Script_Game.dll at 0F7C0000, the file says 10000000), so the
-            // loader has rebased this address: it differs from the file and is NOT compared (the first version of this
-            // check compared it and therefore never patched anything - "differs from the expected one" in the log).
-            GEU8 const arrExpected[] = {0xFF, 0x15, 0x00, 0x00, 0x00, 0x00, // call dword ptr [GetCurrentDifficulty]
-                                        0x83, 0xF8, 0x02,                   // cmp eax, 2 (Hard)
-                                        0x75, 0x20};                        // jne +0x20 (skip the multiplication)
-            GEU8 *pPlace = pBase + 0x4DB8;
-            GEBool bSame = GETrue;
-            for (size_t i = 0; i < sizeof(arrExpected); ++i)
-            {
-                if (i >= 2 && i < 6)
-                    continue;
-                if (pPlace[i] != arrExpected[i])
-                    bSame = GEFalse;
-            }
-            if (!bSame)
-            {
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] The code of Script_Game.dll differs from the expected one "
-                                             "(bytes %02X %02X .. %02X %02X %02X %02X %02X): the arena speed-up of the "
-                                             "hard difficulty is left as it is.\n",
-                                             pPlace[0], pPlace[1], pPlace[6], pPlace[7], pPlace[8], pPlace[9], pPlace[10]);
-                return;
-            }
-            DWORD dwOld = 0;
-            GEU8 *pJump = pBase + 0x4DC1;
-            if (!::VirtualProtect(pJump, 1, PAGE_EXECUTE_READWRITE, &dwOld))
-            {
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Cannot unlock the code for the arena speed-up patch.\n");
-                return;
-            }
-            *pJump = 0xEB; // jne -> jmp short
-            DWORD dwDummy = 0;
-            ::VirtualProtect(pJump, 1, dwOld, &dwDummy);
-            ::FlushInstructionCache(::GetCurrentProcess(), pJump, 1);
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] The x1.25 attack speed of the arena opponent on the hard "
-                                         "difficulty is removed.\n");
-        }
-    } // namespace
-
-    //
-    // v1.0.35.0: THE DIALOGUE WITH A TAMED / DOMINATED CREATURE ("Tame Animal", "Word of Control": party member type 4,
-    // the hero is the party leader). The engine refuses to talk to monsters and slaves, so the two native lines of the
-    // hero (owner "PC_Hero") are taken over for such a partner only:
-    //  - the info of the condition type Wait (34) becomes the line "Wait here"  -> task ZS_WaitForPlayer, Waiting = true;
-    //  - the info of the condition type Join (14) becomes the line "Follow me"  -> the combat state is reset, the task
-    //    ZS_FollowPlayer (and ContinueRoutine) is set, Waiting = false. It is offered at any time, so the hero can pull
-    //    a creature out of a combat stupor (after a fight, after a teleport).
-    // The native scripts of these two infos (CmdWait / CmdPartyJoin) are NOT run for such a partner: JoinPlayerParty would
-    // rewrite the party member type of the creature. Every other partner / info is left to the native code.
-    // Layout of gCInfo_PS (SDK asserts): m_bInfoGiven +0x18, m_enuCondType +0x28.
-    //
-    namespace
-    {
-        GEInt const INFO_COND_JOIN = 14;
-        GEInt const INFO_COND_DISMISS = 15;    // native "You are free." (PartyDismiss), owner PC_Hero
-        GEInt const INFO_COND_MOBDISMISS = 33; // native second "You are free." (CmdDismiss / MobDismiss), owner PC_Hero
-        GEInt const INFO_COND_WAIT = 34;
-
-        GEInt GetInfoCondType(gCInfo_PS const *a_pInfo)
-        {
-            return *reinterpret_cast<GEInt const *>(reinterpret_cast<GEU8 const *>(a_pInfo) + 0x28);
-        }
-
-        GEBool IsHeroInfo(gCInfo_PS const *a_pInfo)
-        {
-            return _stricmp(a_pInfo->GetOwner().GetText(), "PC_Hero") == 0 ? GETrue : GEFalse;
-        }
-
-        // A tamed animal or a dominated person / orc of the hero (party member type 4), alive and on his feet.
-        GEBool IsTamedOrDominated(Entity &a_Npc)
-        {
-            if (a_Npc == None || !a_Npc.IsNPC() || a_Npc.IsDead() || a_Npc.IsDown())
-                return GEFalse;
-            if (!IsHeroControlled(a_Npc))
-                return GEFalse;
-            return a_Npc.Party.PartyMemberType == gEPartyMemberType_Controlled ? GETrue : GEFalse;
-        }
-
-        // The partner of the running dialogue is such a creature.
-        GEBool GetDialogPartner(gCInfo_PS const *a_pInfo, Entity &o_Npc)
-        {
-            gCInfoManager_PS *pManager = a_pInfo->m_pInfoManager ? a_pInfo->m_pInfoManager
-                                                                  : gCInfoManager_PS::GetInstance();
-            if (!pManager)
-                return GEFalse;
-            gCEntity *pPartner = pManager->GetDialogPartnerNPC();
-            if (!pPartner)
-                return GEFalse;
-            o_Npc = Entity(static_cast<eCEntity const *>(pPartner));
-            if (!IsTamedOrDominated(o_Npc))
-                return GEFalse;
-            return GETrue;
-        }
-
-        void OrderWait(Entity &a_Npc)
-        {
-            EndBrawlOf(a_Npc, "dialogue: wait here"); // the combat state is wiped
-            MarkWaiterUserPublic(a_Npc);              // v1.0.68.0: the player's order
-            a_Npc.Party.Waiting = GETrue;
-            a_Npc.Routine.FullStop();
-            a_Npc.Routine.SetTask("ZS_WaitForPlayer");
-            PrintCompanionWaitMessage(a_Npc);
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Dialogue: '%s' (party type %d) is told to wait here.\n",
-                                         a_Npc.GetName().GetText(), static_cast<int>(a_Npc.Party.PartyMemberType));
-        }
-
-        void OrderFollow(Entity &a_Npc)
-        {
-            ClearWaiterMarksPublic(a_Npc); // v1.0.68.0
-            a_Npc.Party.Waiting = GEFalse;
-            EndBrawlOf(a_Npc, "dialogue: follow me"); // wipes the combat state, sets ZS_FollowPlayer + ContinueRoutine
-            a_Npc.Party.Waiting = GEFalse;
-            a_Npc.Routine.SetTask("ZS_FollowPlayer");
-            a_Npc.Routine.ContinueRoutine();
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] Dialogue: '%s' (party type %d) is told to follow the hero.\n",
-                                         a_Npc.GetName().GetText(), static_cast<int>(a_Npc.Party.PartyMemberType));
-        }
-
-        // gCInfo_PS::AreConditionsFulfilled() const (Game.dll): the line is offered for such a partner whatever the native
-        // rules (no talking to monsters / slaves) say. "Wait here" only while he does not wait yet.
-        mCFunctionHook Hook_InfoConditions;
-
-        // v1.0.39.0: the text of the dismissal line: "Ты свободен." (any ending of . / ! / spaces).
-        GEBool IsFreeLineText(bCUnicodeString const &a_strText)
-        {
-            static wchar_t const arrFree[] = L"\x0422\x044B \x0441\x0432\x043E\x0431\x043E\x0434\x0435\x043D"; // "Ты свободен"
-            GELPCUnicodeChar pText = a_strText.GetText();
-            size_t const uLen = wcslen(arrFree);
-            if (!pText || wcsncmp(pText, arrFree, uLen) != 0)
-                return GEFalse;
-            for (pText += uLen; *pText; ++pText)
-                if (*pText != L'.' && *pText != L'!' && *pText != L' ')
-                    return GEFalse;
-            return GETrue;
-        }
-
-        GEBool GE_STDCALL InfoConditions(gCInfo_PS *a_pThis)
-        {
-            using mFOriginal = GEBool(GE_STDCALL *)(gCInfo_PS *);
-            // v1.0.39.0: FILTER BY TEXT. While a dialogue with a tamed / dominated creature (type 4) runs, the lines whose text
-            // is "Ты свободен." are counted: exactly ONE of them stays - the first info of that text (in the list of the
-            // manager) that belongs to the hero or to the partner himself; every other one is hidden, whatever its condition.
-            if (a_pThis)
-            {
-                gCInfoManager_PS *pManager = a_pThis->m_pInfoManager ? a_pThis->m_pInfoManager
-                                                                      : gCInfoManager_PS::GetInstance();
-                GEBool const bRunning = pManager && *(reinterpret_cast<GEU8 const *>(pManager) + 0x14) != 0;
-                Entity Partner;
-                if (bRunning && GetDialogPartner(a_pThis, Partner) && IsFreeLineText(a_pThis->GetDialogDescription()))
-                {
-                    bCString const strPartner = Partner.GetName();
-                    // The keeper: the info of the native PartyDismiss (cond 15, whose script handles type 4) when it carries
-                    // the text, otherwise the first info of that text.
-                    gCInfo_PS *pKeeper = nullptr;
-                    gCInfo_PS *pFirst = nullptr;
-                    bTPtrArray<gCInfo_PS *> const &arrInfos = pManager->GetInfos();
-                    for (GEInt i = 0; i < arrInfos.GetCount(); ++i)
-                    {
-                        gCInfo_PS *pInfo = arrInfos.GetAt(i);
-                        if (!pInfo)
-                            continue;
-                        GEBool const bHeroOrPartner = IsHeroInfo(pInfo) || pInfo->GetOwner() == strPartner;
-                        if (!bHeroOrPartner || !IsFreeLineText(pInfo->GetDialogDescription()))
-                            continue;
-                        if (!pFirst)
-                            pFirst = pInfo;
-                        if (!pKeeper && GetInfoCondType(pInfo) == INFO_COND_DISMISS)
-                            pKeeper = pInfo;
-                    }
-                    if (!pKeeper)
-                        pKeeper = pFirst;
-                    return pKeeper == a_pThis ? GETrue : GEFalse;
-                }
-            }
-            if (a_pThis && IsHeroInfo(a_pThis))
-            {
-                GEInt const iType = GetInfoCondType(a_pThis);
-                Entity Npc;
-                if ((iType == INFO_COND_WAIT || iType == INFO_COND_JOIN || iType == INFO_COND_DISMISS ||
-                     iType == INFO_COND_MOBDISMISS) &&
-                    GetDialogPartner(a_pThis, Npc))
-                {
-                    // v1.0.37.0: MUTUALLY EXCLUSIVE lines by the flag Party.Waiting: a creature that follows the hero offers
-                    // ONLY "Wait here", a creature that waits offers ONLY "Follow me".
-                    GEBool const bWaiting = Npc.Party.Waiting;
-                    if (iType == INFO_COND_WAIT)
-                        return bWaiting ? GEFalse : GETrue;
-                    if (iType == INFO_COND_JOIN)
-                        return bWaiting ? GETrue : GEFalse;
-                    // v1.0.37.0: EXACTLY ONE "You are free." Two native infos carry the line (PartyDismiss, cond 15, and
-                    // MobDismiss, cond 33): the first stays (always offered), the duplicate is hidden.
-                    return iType == INFO_COND_DISMISS ? GETrue : GEFalse;
-                }
-            }
-            return Hook_InfoConditions.GetOriginalFunction<mFOriginal>()(a_pThis);
-        }
-
-        // gCInfo_PS::Execute(gCInfoManager_PS *) (Game.dll): the chosen line. The order is given at once, the native
-        // script is skipped and the dialogue is closed.
-        mCFunctionHook Hook_InfoExecute;
-        GEBool GE_STDCALL InfoExecute(gCInfo_PS *a_pThis, gCInfoManager_PS *a_pManager)
-        {
-            using mFOriginal = GEBool(GE_STDCALL *)(gCInfo_PS *, gCInfoManager_PS *);
-            if (a_pThis && IsHeroInfo(a_pThis))
-            {
-                GEInt const iType = GetInfoCondType(a_pThis);
-                Entity Npc;
-                if ((iType == INFO_COND_WAIT || iType == INFO_COND_JOIN) && GetDialogPartner(a_pThis, Npc))
-                {
-                    if (iType == INFO_COND_WAIT)
-                        OrderWait(Npc);
-                    else
-                        OrderFollow(Npc);
-                    gCInfoManager_PS *pManager = a_pManager ? a_pManager : a_pThis->m_pInfoManager;
-                    if (pManager)
-                        pManager->EndInfoManager(nullptr);
-                    *(reinterpret_cast<GEU8 *>(a_pThis) + 0x18) = 0; // the line can be chosen again and again
-                    return GETrue;
-                }
-                // v1.0.68.0: THE ORDER OF THE PLAYER FOR AN ORDINARY COMPANION (party type 1..3). The native script runs unchanged; here only
-                // the source of the order is written down: "Wait here" -> WaiterType USER (never carried by a teleport, never released by the
-                // plugin), "Follow me" -> the mark is dropped.
-                if (iType == INFO_COND_WAIT || iType == INFO_COND_JOIN)
-                {
-                    gCInfoManager_PS *pPartnerManager = a_pManager ? a_pManager : (a_pThis->m_pInfoManager ? a_pThis->m_pInfoManager
-                                                                                                           : gCInfoManager_PS::GetInstance());
-                    gCEntity *pPartner = pPartnerManager ? pPartnerManager->GetDialogPartnerNPC() : nullptr;
-                    if (pPartner)
-                    {
-                        Entity Companion(static_cast<eCEntity const *>(pPartner));
-                        if (Companion != None && Companion.IsNPC() && !Companion.IsDead() && IsHeroControlled(Companion))
-                        {
-                            if (iType == INFO_COND_WAIT)
-                            {
-                                MarkWaiterUserPublic(Companion);
-                                char strLine[200] = {};
-                                _snprintf_s(strLine, sizeof(strLine), _TRUNCATE,
-                                            "[GenomeLogicFix][teleport] dialogue | '%s' | party type %d | told to WAIT by the player: WaiterType=USER",
-                                            Companion.GetName().GetText(), static_cast<int>(Companion.Party.PartyMemberType));
-                                GetDefaultLogger().LogFormat("%s\n", strLine);
-                                CrashDiag::Note(strLine);
-                            }
-                            else
-                                ClearWaiterMarksPublic(Companion);
-                        }
-                    }
-                }
-            }
-            return Hook_InfoExecute.GetOriginalFunction<mFOriginal>()(a_pThis, a_pManager);
-        }
-
-        // gCInfo_PS::GetDialogDescription() const: the text of the line (hidden return buffer).
-        mCFunctionHook Hook_InfoDescription;
-        bCUnicodeString *GE_STDCALL InfoDescription(gCInfo_PS *a_pThis, bCUnicodeString *a_pRet)
-        {
-            using mFOriginal = bCUnicodeString *(GE_STDCALL *)(gCInfo_PS *, bCUnicodeString *);
-            bCUnicodeString *pResult = Hook_InfoDescription.GetOriginalFunction<mFOriginal>()(a_pThis, a_pRet);
-            if (a_pThis && a_pRet && IsHeroInfo(a_pThis))
-            {
-                GEInt const iType = GetInfoCondType(a_pThis);
-                Entity Npc;
-                if ((iType == INFO_COND_WAIT || iType == INFO_COND_JOIN) && GetDialogPartner(a_pThis, Npc))
-                {
-                    if (iType == INFO_COND_WAIT)
-                        *a_pRet = L"\x0416\x0434\x0438 \x0437\x0434\x0435\x0441\x044C"; // "Жди здесь"
-                    else
-                        *a_pRet = L"\x0418\x0434\x0438 \x0437\x0430 \x043C\x043D\x043E\x0439"; // "Иди за мной"
-                }
-            }
-            return pResult;
-        }
-
-        // Entity::HasInfo(other) const (Script.dll): "the hero has something to say to this NPC". The perception scripts
-        // (AssessTalk, the focus) ask it before the creature can be spoken to. True for such a creature.
-        mCFunctionHook Hook_EntityHasInfo;
-        GEBool GE_STDCALL EntityHasInfo(Entity *a_pThis, Entity const *a_pOther)
-        {
-            using mFOriginal = GEBool(GE_STDCALL *)(Entity *, Entity const *);
-            GEBool const bResult = Hook_EntityHasInfo.GetOriginalFunction<mFOriginal>()(a_pThis, a_pOther);
-            if (bResult || !a_pThis || !a_pOther || a_pThis->GetInstance() == nullptr || a_pOther->GetInstance() == nullptr)
-                return bResult;
-            Entity Hero = Entity::GetPlayer();
-            Entity First(*a_pThis);
-            Entity Second(*a_pOther);
-            if (First == Hero && IsTamedOrDominated(Second))
-                return GETrue;
-            if (Second == Hero && IsTamedOrDominated(First))
-                return GETrue;
-            return bResult;
-        }
-    } // namespace
+}
 
 
-
-    void InstallArenaHooks()
-    {
-        // The default logger of the SDK is stdout, which the game does not have: write the log of the plugin to
-        // <Documents>\Gothic3\logs\Script_GenomeLogicFix.log.
-        bCString const strLogPath = GetAndCreateLogFilePath("logs", "Script_GenomeLogicFix.log");
-        if (!strLogPath.IsEmpty())
-        {
-            // The logger opens the file for writing, i.e. the log of the previous run is lost - exactly the log of a run
-            // that ended with a crash. It is kept as Script_GenomeLogicFix.prev.log (one generation).
-            char strPrev[MAX_PATH] = {};
-            strncpy_s(strPrev, strLogPath.GetText(), _TRUNCATE);
-            size_t const uLen = strlen(strPrev);
-            if (uLen > 4 && _stricmp(strPrev + uLen - 4, ".log") == 0 && uLen + 5 < MAX_PATH)
-            {
-                strcpy_s(strPrev + uLen - 4, MAX_PATH - (uLen - 4), ".prev.log");
-                ::MoveFileExA(strLogPath.GetText(), strPrev, MOVEFILE_REPLACE_EXISTING);
-            }
-            SetDefaultLogger(mCLoggingAdmin<mCFileLogger>::GetLogger(strLogPath.GetText()));
-        }
-
-        LoadConfig();
-
-        // v1.0.66.0: the crash reporter goes first (before any hook of the plugin can be hit by a fault).
-        if (g_Config.CrashDiagnostics && !strLogPath.IsEmpty())
-            CrashDiag::Install(strLogPath.GetText());
-
-        auto const InstallOne = [](mCFunctionHook &a_Hook, GELPCChar a_strName, GELPVoid a_pNew,
-                                   GELPCChar a_strModule = "Script.dll")
-        {
-            HMODULE hModule = ::GetModuleHandleA(a_strModule);
-            GELPVoid pOriginal = hModule ? reinterpret_cast<GELPVoid>(::GetProcAddress(hModule, a_strName)) : nullptr;
-            if (!pOriginal || !a_Hook.Prepare(pOriginal, a_pNew).ThisCall().Hook())
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Failed to hook %s\n", a_strName);
-            else
-                GetDefaultLogger().LogFormat("[GenomeLogicFix] Hooked %s\n", a_strName);
-        };
-        InstallOne(Hook_GuiPrintGameMessage, "?PrintGameMessage@GUI2@@QAEXABVbCUnicodeString@@W4gEGameMessageType@@@Z",
-                   reinterpret_cast<GELPVoid>(&GuiPrintGameMessage));
-        InstallOne(Hook_SessionStart, "?Start@gCSession@@QAEXW4gESession_StartMode@@@Z",
-                   reinterpret_cast<GELPVoid>(&SessionStart), "Game.dll");
-        InstallOne(Hook_SessionStop, "?Stop@gCSession@@QAEXXZ", reinterpret_cast<GELPVoid>(&SessionStop), "Game.dll");
-        InstallOne(Hook_NpcSetCurrentAttacker, "?SetCurrentAttacker@PSNpc@@QAEXABVEntity@@@Z",
-                   reinterpret_cast<GELPVoid>(&NpcSetCurrentAttacker));
-        InstallOne(Hook_NpcSetLastAttacker, "?SetLastAttacker@PSNpc@@QAEXABVEntity@@@Z",
-                   reinterpret_cast<GELPVoid>(&NpcSetLastAttacker));
-        InstallOne(Hook_NpcSetLastCast, "?SetLastCast@PSNpc@@QAEXXZ", reinterpret_cast<GELPVoid>(&NpcSetLastCast));
-        InstallOne(Hook_NpcEnableStatusEffects, "?EnableStatusEffects@PSNpc@@QAEXH_N@Z",
-                   reinterpret_cast<GELPVoid>(&NpcEnableStatusEffects));
-        InstallOne(Hook_EntitySetTimeScale, "?SetTimeScale@Entity@@QAEXM@Z",
-                   reinterpret_cast<GELPVoid>(&EntitySetTimeScale));
-        InstallOne(Hook_RoutineSetTimeScale, "?SetTimeScale@PSRoutine@@QAEXM@Z",
-                   reinterpret_cast<GELPVoid>(&RoutineSetTimeScale));
-        InstallOne(Hook_NpcCanHit, "?CanHit@PSNpc@@QAE_NK@Z", reinterpret_cast<GELPVoid>(&NpcCanHit));
-        InstallOne(Hook_QuestSetStatus, "?SetStatus@gCQuest_PS@@QAE_NABW4gEQuestStatus@@@Z",
-                   reinterpret_cast<GELPVoid>(&QuestSetStatus), "Game.dll");
-        InstallOne(Hook_EntityDoDamage, "?DoDamage@Entity@@QAEXABV1@KW4gEDamageType@@@Z",
-                   reinterpret_cast<GELPVoid>(&EntityDoDamage));
-        InstallOne(Hook_PartyGetLeader, "?GetPartyLeader@PSParty@@QBE?AVEntity@@XZ",
-                   reinterpret_cast<GELPVoid>(&PartyGetLeader));
-        // v1.0.35.0: the dialogue lines "wait here" / "follow me" for tamed / dominated creatures.
-        InstallOne(Hook_InfoConditions, "?AreConditionsFulfilled@gCInfo_PS@@IBE_NXZ",
-                   reinterpret_cast<GELPVoid>(&InfoConditions), "Game.dll");
-        InstallOne(Hook_InfoExecute, "?Execute@gCInfo_PS@@QAE_NPAVgCInfoManager_PS@@@Z",
-                   reinterpret_cast<GELPVoid>(&InfoExecute), "Game.dll");
-        InstallOne(Hook_InfoDescription, "?GetDialogDescription@gCInfo_PS@@QBE?AVbCUnicodeString@@XZ",
-                   reinterpret_cast<GELPVoid>(&InfoDescription), "Game.dll");
-        InstallOne(Hook_EntityHasInfo, "?HasInfo@Entity@@QBE_NABV1@@Z", reinterpret_cast<GELPVoid>(&EntityHasInfo));
-        // v1.0.39.0: the low-level teleport of the hero (both overloads), before any third-party auto-teleport plugin.
-
-        // v1.0.59.0: the x1.25 speed-up of the hard difficulty is removed only while EnableHardDifficultyAttackSpeed is false.
-        if (!g_Config.EnableHardDifficultyAttackSpeed)
-            RemoveArenaHardSpeedUp();
-        else
-            GetDefaultLogger().LogFormat("[GenomeLogicFix] EnableHardDifficultyAttackSpeed=true: the native speed-up of the arena "
-                                         "opponent on the hard difficulty is kept.\n");
-
-        // v1.0.59.0: the line of the stance of ZS_ReactToDamage becomes replaceable (see the hook of ZS_ReactToDamage).
-        PatchReactToDamageSvm();
-
-        // Script hooks (Stage 3) are registered by the static blocks above; apply them now.
-        GetScriptHookRegistry().Hook();
-
-        // v1.0.53.0: FreezeFix (FreezeFix.cpp): the combat memory survives ZS_Freeze / ZS_Freeze_Loop.
-        InitFreezeFixHooks();
-    }
-} // namespace RequirementsCheck
-
-mCScriptHookRegistry &GetScriptHookRegistry()
+ME_DEFINE_AND_HOOK_SCRIPT(MagicPoison)
 {
-    static mCScriptHookRegistry s_Registry;
-    return s_Registry;
+    return SocialLogic::Hooks::HostileMagic(MagicPoison_Original, "MagicPoison", a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
+}
+
+ME_DEFINE_AND_HOOK_SCRIPT(MagicDisease)
+{
+    return SocialLogic::Hooks::HostileMagic(MagicDisease_Original, "MagicDisease", a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
+}
+
+ME_DEFINE_AND_HOOK_SCRIPT(MagicFear)
+{
+    return SocialLogic::Hooks::HostileMagic(MagicFear_Original, "MagicFear", a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
+}
+
+ME_DEFINE_AND_HOOK_SCRIPT(MagicSleep)
+{
+    return SocialLogic::Hooks::HostileMagic(MagicSleep_Original, "MagicSleep", a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
+}
+
+ME_DEFINE_AND_HOOK_SCRIPT(MagicFreeze)
+{
+    return SocialLogic::Hooks::HostileMagic(MagicFreeze_Original, "MagicFreeze", a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
+}
+
+ME_DEFINE_AND_HOOK_SCRIPT(MagicStun)
+{
+    return SocialLogic::Hooks::HostileMagic(MagicStun_Original, "MagicStun", a_pSPU, a_pSelfEntity, a_pOtherEntity, a_iArgs);
 }

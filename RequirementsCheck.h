@@ -22,7 +22,7 @@
 //   - gCInventorySlot::OnApplyStats / OnUnApplyStats        (equip / unequip of an item)
 //   - gCAttribute::SetModifier / SetBaseValue               (main attributes, buffs, potions, permanent plants)
 //   - gCStat::SetBaseMaximum / SetMaximumModifier / SetMaximum   (PERMANENT maximum of HP, MP, SP)
-//   - gCPlayerMemory_PS::Add/Set Value, BaseValue, Modifier, Maximum and ApplyMod / UnapplyMod / Consume
+//   - gCPlayerMemory_PS::Add/Set Value, BaseValue, Modifier, Maximum and ApplyMod / UnapplyMod
 // NOT a trigger: any change of the CURRENT value of HP, MP or SP (damage, running, healing, the gradual
 // regeneration ticks of potions / meat / herbs from the Update Pack). Those are gCStat objects (class check
 // through the gCStat vtable), whose current value lives in BaseValue. Such ticks are passed straight through to
@@ -147,63 +147,4 @@ namespace RequirementsCheck
     // GETrue, if a_pAttribute is a gCStat (dynamic HP / MP / SP), i.e. its BaseValue is the CURRENT value.
     GEBool IsDynamicStat(gCAttribute const *a_pAttribute);
 
-    // Genome Logic Fix configuration, file <Gothic 3>\Ini\Script_GenomeLogicFix.ini (section [Main]).
-    // The file is created with the defaults when it does not exist.
-    struct Config
-    {
-        // true (default): using a consumable (food, meat, potion) during a PHYSICALLY started arena fight is a defeat
-        // ("Выход за пределы арены"). false: the rule is off, healing in the arena is allowed.
-        // INI line: PunishArenaPotions=true
-        GEBool PunishArenaPotions = GETrue;
-
-        // v1.0.51.0: the black list of the teleport: the names (Entity::GetName(), the native name, NOT the name over the head),
-        // separated by commas / semicolons, any case. A companion of the party types 1..3 whose name is in the list is NEVER
-        // carried to the hero through a teleport stone / rune: he stays at the old place and waits natively (WaitPlayerParty),
-        // whether he was following the hero or not. The two names are the example of the format.
-        // INI line: IgnoreTeleportNames=Nefarius,Orknarok
-        char IgnoreTeleportNames[512] = "Nefarius,Orknarok";
-
-        // v1.0.52.0: true (default): burning / freezing of the arena opponent that comes from an ENCHANTED MELEE WEAPON of the hero
-        // (a fire / ice sword: the hero is not casting, did not cast and did not shoot just now) is NOT a violation - the duel goes
-        // on as the normal melee duel. The spells themselves (the cast states) and the bow / crossbow stay forbidden. false: every
-        // burning / freezing of the opponent is the crime of the arena, as before.
-        // INI line: AllowArenaEnchantedWeapons=true
-        GEBool AllowArenaEnchantedWeapons = GETrue;
-
-        // v1.0.59.0: false (default): the native x1.25 speed-up of the animations (attacks, parades, stumbles) of the arena opponent on the
-        // HARD difficulty is removed (the code patch of Script_Game.dll and the clamp of SetTimeScale). true: the native speed-up returns.
-        // The change of this key is read at the start of the game.
-        // INI line: EnableHardDifficultyAttackSpeed=false
-        GEBool EnableHardDifficultyAttackSpeed = GEFalse;
-
-        // v1.0.59.0: false (default): the game may NOT skip the pause between two blows (MinHitDuration of ge3.ini) of the arena
-        // opponent (the native CanHit skips it for the attack reason Arena): the opponent strikes with the honest pauses of ge3.ini and
-        // of the templates of the NPCs. true: the native machine-gun spam of blows returns.
-        // INI line: DisableMinHitDurationOnHard=false
-        GEBool DisableMinHitDurationOnHard = GEFalse;
-
-        // v1.0.66.0: true (default): the crash reporter (CrashDiag) writes <Documents>\Gothic3\logs\Script_GenomeLogicFix.crash.log when the game
-        // hits a fatal exception (the call stack found on the stack with module+offset, the names of the NPCs whose objects the engine was
-        // processing, the end of the plugin log). It never changes how the game behaves. INI line: CrashDiagnostics=true
-        GEBool CrashDiagnostics = GETrue;
-    };
-
-    Config &GetConfig();
-    // Reads the INI (writes it with the defaults if missing or if the key is absent).
-    void LoadConfig();
-    // Writes the current configuration.
-    GEBool SaveConfig();
-    // v1.0.51.0: GETrue, if the native name of an NPC is in Config::IgnoreTeleportNames (any case, spaces around are cut).
-    GEBool IsTeleportNameIgnored(GELPCChar a_strName);
-
-    // Arena judging (hooks of Script_Game.dll scripts), installed from Install() through the script hook registry.
-    void InstallArenaHooks();
-
-    // Stage 2: called when the hero starts to consume an item (food, meat, potion).
-    void OnHeroConsumeStarted();
-
-    // v1.0.40.0: the script task / state of the routine of the HERO has just been set (gCScriptRoutine_PS::SetCurrentTask /
-    // AISetTask: a_bIsTask = true, SetCurrentState / AISetState: false). Called after the original, whatever RC_DIAGNOSTICS is.
-    // The arena judge follows the magic mode of the hero through it (PS_Magic, PS_Magic_QuickCast, ...).
-    void OnHeroRoutineChange(GELPCChar a_strName, GEBool a_bIsTask);
 } // namespace RequirementsCheck

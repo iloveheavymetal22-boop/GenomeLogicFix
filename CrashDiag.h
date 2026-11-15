@@ -13,7 +13,7 @@
 //   - the last lines of Script_GenomeLogicFix.log (what the plugin did right before).
 // The handler never handles anything: it always lets the exception go on (the engine log is written as before). An exception that
 // happens inside a call the plugin guards itself (GuardEnter / GuardLeave) is reported too, marked as guarded.
-// The previous crash report is kept as Script_GenomeLogicFix.crash.prev.log. INI key CrashDiagnostics=true (default) turns it on.
+// The previous crash report is kept as Script_GenomeLogicFix.crash.prev.log. INI key Diagnostics=true turns it on (default false).
 //
 namespace CrashDiag
 {

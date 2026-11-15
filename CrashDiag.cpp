@@ -1,3 +1,4 @@
+﻿#include "DebugLog.h"
 #include "CrashDiag.h"
 
 #include <g3sdk/Script.h>
@@ -382,17 +383,23 @@ namespace CrashDiag
 
     void GuardEnter()
     {
+        if (!DebugLog::IsEnabled())
+            return;
         ::InterlockedIncrement(&g_lGuard);
     }
 
     void GuardLeave()
     {
+        if (!DebugLog::IsEnabled())
+            return;
         if (g_lGuard > 0)
             ::InterlockedDecrement(&g_lGuard);
     }
 
     void Note(char const *a_strLine)
     {
+        if (!DebugLog::IsEnabled())
+            return;
         if (!a_strLine)
             return;
         LONG const lSlot = (::InterlockedIncrement(&g_lNoteNext) - 1) % NOTE_COUNT;
@@ -405,6 +412,8 @@ namespace CrashDiag
 
     void Install(char const *a_strMainLogPath)
     {
+        if (!DebugLog::IsEnabled())
+            return;
         if (g_pHandler || !a_strMainLogPath || a_strMainLogPath[0] == 0)
             return;
         strncpy_s(g_strMainLogPath, sizeof(g_strMainLogPath), a_strMainLogPath, _TRUNCATE);

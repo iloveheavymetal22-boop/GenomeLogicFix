@@ -1,4 +1,6 @@
+﻿#include "DebugLog.h"
 #include "RequirementsCheck.h"
+#include "PluginRuntime.h"
 
 #include <g3sdk/Script.h>
 #include <g3sdk/util/Hook.h>
@@ -10,12 +12,6 @@
 
 #include <cstdarg>
 #include <cstdio>
-
-gSScriptInit &GetScriptInit()
-{
-    static gSScriptInit s_ScriptInit;
-    return s_ScriptInit;
-}
 
 namespace RequirementsCheck
 {
@@ -55,7 +51,6 @@ namespace RequirementsCheck
         GELPCChar const NAME_MemorySetMaximum = RC_PM_NAME(SetMaximum);
         GELPCChar const NAME_MemoryApplyMod = RC_PM_OP_NAME(ApplyMod);
         GELPCChar const NAME_MemoryUnapplyMod = RC_PM_OP_NAME(UnapplyMod);
-        GELPCChar const NAME_MemoryConsume = RC_PM_OP_NAME(Consume);
         // Diagnostics only (RC_DIAGNOSTICS): functions that may start the animation of the hero.
         GELPCChar const NAME_DiagSetCurrentState = "?SetCurrentState@gCScriptRoutine_PS@@QAEXABVbCString@@@Z";
         GELPCChar const NAME_DiagSetCurrentTask = "?SetCurrentTask@gCScriptRoutine_PS@@QAEXABVbCString@@@Z";
@@ -99,7 +94,7 @@ namespace RequirementsCheck
             HMODULE hModule = ::GetModuleHandleA(a_strModule);
             GELPVoid pAddress = hModule ? reinterpret_cast<GELPVoid>(::GetProcAddress(hModule, a_strName)) : nullptr;
             if (!pAddress)
-                GetDefaultLogger().LogFormat("[RequirementsCheck] Export not found in %s: %s\n", a_strModule, a_strName);
+                DebugLog::GetLogger().LogFormat("[RequirementsCheck] Export not found in %s: %s\n", a_strModule, a_strName);
             return pAddress;
         }
 
@@ -133,7 +128,7 @@ namespace RequirementsCheck
                 if (!s_bLogged)
                 {
                     s_bLogged = GETrue;
-                    GetDefaultLogger().LogFormat("[RequirementsCheck] Check skipped: gCSession::IsGameRunning() is "
+                    DebugLog::GetLogger().LogFormat("[RequirementsCheck] Check skipped: gCSession::IsGameRunning() is "
                                                  "false (build with RC_REQUIRE_GAME_RUNNING=0 to disable).\n");
                 }
                 return nullptr;
@@ -235,7 +230,7 @@ namespace RequirementsCheck
             if (bMismatch && !s_bMismatchLogged)
             {
                 s_bMismatchLogged = GETrue;
-                GetDefaultLogger().LogFormat("[RequirementsCheck] WARNING: gCStats (%d) and gCPlayerMemory_PS (%d) "
+                DebugLog::GetLogger().LogFormat("[RequirementsCheck] WARNING: gCStats (%d) and gCPlayerMemory_PS (%d) "
                                              "disagree for attribute '%s' (max=%d), using gCPlayerMemory_PS.\n",
                                              iStats, iMemory, static_cast<GELPCChar>(a_strTag), a_bMax ? 1 : 0);
             }
@@ -574,7 +569,7 @@ namespace RequirementsCheck
                 else
                     continue;
 
-                GetDefaultLogger().LogFormat("[RequirementsCheck] Unequip stack %d: %s requirement not met.\n", i,
+                DebugLog::GetLogger().LogFormat("[RequirementsCheck] Unequip stack %d: %s requirement not met.\n", i,
                                              strReason);
                 if (a_Inventory.UnEquipStack(i))
                     return GETrue;
@@ -642,7 +637,7 @@ namespace RequirementsCheck
 
             char strCaller[300] = {};
             DiagDescribeAddress(a_pCaller, strCaller, sizeof(strCaller));
-            GetDefaultLogger().LogFormat("[RequirementsCheck][diag] +%u ms %s | caller %s | %s\n",
+            DebugLog::GetLogger().LogFormat("[RequirementsCheck][diag] +%u ms %s | caller %s | %s\n",
                                          static_cast<unsigned>(::GetTickCount() - g_u32DiagStart), a_strWhat, strCaller,
                                          strDetail);
         }
@@ -706,7 +701,7 @@ namespace RequirementsCheck
             gCInventorySlot const *pExcluded = g_pPendingExcluded;
             g_pPendingExcluded = nullptr;
             if (Enforce(pExcluded) > 0)
-                GetDefaultLogger().LogFormat("[RequirementsCheck] Trigger: %s.\n", GetTriggerName(g_enuPendingTrigger));
+                DebugLog::GetLogger().LogFormat("[RequirementsCheck] Trigger: %s.\n", GetTriggerName(g_enuPendingTrigger));
         }
 
         // Brackets every hooked operation (original function in between).
@@ -1014,7 +1009,7 @@ namespace RequirementsCheck
                     continue;
 
                 bLacking = GETrue;
-                GetDefaultLogger().LogFormat("[RequirementsCheck] PrintMissingRequirements: stack %d, attribute '%s': "
+                DebugLog::GetLogger().LogFormat("[RequirementsCheck] PrintMissingRequirements: stack %d, attribute '%s': "
                                              "clean value %d < required %d (lacks %d, %d equipped item(s) are "
                                              "replaced and not counted), the item cannot be used.\n",
                                              a_iIndex, static_cast<GELPCChar>(strTag), iHave, iRequired, iMissing,
@@ -1064,7 +1059,14 @@ namespace RequirementsCheck
         GEBool IsHeroRoutine(gCScriptRoutine_PS *a_pRoutine)
         {
             eCEntity const *pOwner = a_pRoutine ? static_cast<eCEntityPropertySet *>(a_pRoutine)->GetEntity() : nullptr;
-            return pOwner && pOwner == GetHeroEntity();
+            if (!pOwner)
+                return GEFalse;
+            if (pOwner == GetHeroEntity())
+                return GETrue;
+            // The player can be a separate transformed body. Forward its task/state
+            // events too; equipment validation still uses GetHeroEntity unchanged.
+            return g_ppCurrentSession && *g_ppCurrentSession && (*g_ppCurrentSession)->IsGameRunning() &&
+                   pOwner == (*g_ppCurrentSession)->GetPlayer();
         }
 
         mCFunctionHook Hook_DiagSetCurrentState;
@@ -1077,7 +1079,7 @@ namespace RequirementsCheck
 #endif
             Hook_DiagSetCurrentState.GetOriginalFunction<mFOriginal>()(a_pThis, a_pstrState);
             if (a_pstrState && IsHeroRoutine(a_pThis))
-                OnHeroRoutineChange(a_pstrState->GetText(), false);
+                PluginRuntime::OnHeroRoutineChange(a_pstrState->GetText(), false);
         }
 
         mCFunctionHook Hook_DiagSetCurrentTask;
@@ -1090,7 +1092,7 @@ namespace RequirementsCheck
 #endif
             Hook_DiagSetCurrentTask.GetOriginalFunction<mFOriginal>()(a_pThis, a_pstrTask);
             if (a_pstrTask && IsHeroRoutine(a_pThis))
-                OnHeroRoutineChange(a_pstrTask->GetText(), true);
+                PluginRuntime::OnHeroRoutineChange(a_pstrTask->GetText(), true);
         }
 
         mCFunctionHook Hook_DiagAISetState;
@@ -1103,7 +1105,7 @@ namespace RequirementsCheck
 #endif
             Hook_DiagAISetState.GetOriginalFunction<mFOriginal>()(a_pThis, a_pstrState);
             if (a_pstrState && IsHeroRoutine(a_pThis))
-                OnHeroRoutineChange(a_pstrState->GetText(), false);
+                PluginRuntime::OnHeroRoutineChange(a_pstrState->GetText(), false);
         }
 
         mCFunctionHook Hook_DiagAISetTask;
@@ -1116,7 +1118,7 @@ namespace RequirementsCheck
 #endif
             Hook_DiagAISetTask.GetOriginalFunction<mFOriginal>()(a_pThis, a_pstrTask);
             if (a_pstrTask && IsHeroRoutine(a_pThis))
-                OnHeroRoutineChange(a_pstrTask->GetText(), true);
+                PluginRuntime::OnHeroRoutineChange(a_pstrTask->GetText(), true);
         }
 
         // gCPlayerMemory_PS::SetIsConsumingItem(bool const &). When the hero finishes consuming, a check that was
@@ -1127,10 +1129,14 @@ namespace RequirementsCheck
             using mFOriginal = void(GE_STDCALL *)(gCPlayerMemory_PS *, GEBool const *);
             // Stage 2: the hero starts to consume food / meat / a potion. In a physically started arena fight this is
             // a defeat (PunishArenaPotions), decided BEFORE the item is used.
-            if (a_pbValue && *a_pbValue && a_pThis == GetHeroMemory())
-                OnHeroConsumeStarted();
+            GEBool const bHero = a_pThis && a_pThis == GetHeroMemory();
+            GEBool const bFinished = bHero && a_pbValue && !*a_pbValue && a_pThis->GetIsConsumingItem();
+            if (bHero && a_pbValue && *a_pbValue)
+                PluginRuntime::OnHeroConsumeStarted();
             BeginOperation();
             Hook_SetIsConsumingItem.GetOriginalFunction<mFOriginal>()(a_pThis, a_pbValue);
+            if (bFinished)
+                QueueCheck(Trigger_AttributeChanged, nullptr);
             EndOperation();
         }
 
@@ -1332,7 +1338,6 @@ namespace RequirementsCheck
         RC_DEFINE_MEMORY_HOOK(SetMaximum, MemoryKind_Maximum)
         RC_DEFINE_MEMORY_OP_HOOK(ApplyMod)
         RC_DEFINE_MEMORY_OP_HOOK(UnapplyMod)
-        RC_DEFINE_MEMORY_OP_HOOK(Consume)
 
         GEBool InstallHook(mCFunctionHook &a_Hook, GELPCChar a_strName, GELPVoid a_pNew,
                            GELPCChar a_strModule = "Game.dll")
@@ -1343,7 +1348,7 @@ namespace RequirementsCheck
 
             if (!a_Hook.Prepare(pOriginal, a_pNew).ThisCall().Hook())
             {
-                GetDefaultLogger().LogFormat("[RequirementsCheck] Failed to hook %s\n", a_strName);
+                DebugLog::GetLogger().LogFormat("[RequirementsCheck] Failed to hook %s\n", a_strName);
                 return GEFalse;
             }
             return GETrue;
@@ -1403,11 +1408,10 @@ namespace RequirementsCheck
             RC_INSTALL_MEMORY_HOOK(SetMaximum)
             RC_INSTALL_MEMORY_HOOK(ApplyMod)
             RC_INSTALL_MEMORY_HOOK(UnapplyMod)
-            RC_INSTALL_MEMORY_HOOK(Consume)
         }
         else
         {
-            GetDefaultLogger().LogFormat("[RequirementsCheck] gCStat vtable not found: SetModifier / SetBaseValue "
+            DebugLog::GetLogger().LogFormat("[RequirementsCheck] gCStat vtable not found: SetModifier / SetBaseValue "
                                          "hooks NOT installed (HP / MP / SP could not be filtered).\n");
             bOk = GEFalse;
         }
@@ -1452,28 +1456,3 @@ namespace RequirementsCheck
     }
 } // namespace RequirementsCheck
 
-extern "C" __declspec(dllexport) gSScriptInit const *GE_STDCALL ScriptInit(void)
-{
-    // Ensure that Script_Game.dll is loaded.
-    GetScriptAdmin().LoadScriptDLL("Script_Game.dll");
-
-    if (!RequirementsCheck::Install())
-        GetDefaultLogger().LogFormat("[RequirementsCheck] Some hooks could not be installed, see messages above.\n");
-    RequirementsCheck::InstallArenaHooks();
-
-    return &GetScriptInit();
-}
-
-//
-// Entry Point
-//
-
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID)
-{
-    switch (dwReason)
-    {
-        case DLL_PROCESS_ATTACH: ::DisableThreadLibraryCalls(hModule); break;
-        case DLL_PROCESS_DETACH: break;
-    }
-    return TRUE;
-}
